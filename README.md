@@ -98,15 +98,21 @@ Volgende updates kunnen via OTA over het netwerk — zie `platformio.ini`.
 
 ## Eerste setup
 
-1. Flash firmware
-2. Steek USB-C voeding erin (niet uit P1-poort — te weinig stroom voor ethernet)
-3. Sluit ethernet-kabel aan
-4. ESP32 maakt verbinding via DHCP
-5. Bij eerste boot zonder API-key: start WiFi-portal `SlimHuys-Setup-XXXX`
-   - Verbind met je telefoon
-   - Vul je SlimHuys API-key in (https://slimhuys.nl/app/account?tab=api)
-6. Plug RJ12-kabel in je P1-poort
-7. Status-LED blijft aan = ethernet + data flow OK
+1. **Open SlimHuys** in je browser → Mijn Huis → "**+ Pairing-code aanmaken**".
+   Je krijgt een 6-cijferige code (10 min geldig).
+2. **Flash firmware** op je WT32-ETH01.
+3. **Steek USB-C voeding erin** (niet uit P1-poort — te weinig stroom voor ethernet).
+4. **Optioneel: ethernet-kabel** aansluiten. Werkt ook puur op WiFi.
+5. **Verbind met `SlimHuys-Setup`-WiFi** vanaf je telefoon (ESP32 hosting AP):
+   - Kies je eigen WiFi-netwerk + wachtwoord (zelfs als je ethernet hebt — dat is voor permanent).
+   - Vul de **6-cijferige pairing-code** in.
+   - Submit.
+6. Device wisselt code in voor api-key, bewaart in NVS, en de SlimHuys-app
+   springt automatisch naar "**Bridge gekoppeld ✓**".
+7. **Plug RJ12-kabel in je P1-poort**. Status-LED blijft aan = data flow OK.
+
+Vanaf nu boot device zelfstandig met opgeslagen credentials. Een nieuwe
+pairing-code is alleen nodig na een factory-reset.
 
 ## Architectuur
 
@@ -116,12 +122,14 @@ Volgende updates kunnen via OTA over het netwerk — zie `platformio.ini`.
 │              ├────▶│  + DSMR-parser  ├───▶│ /v1/me/readings  │
 │  (DSMR v5)   │ 1Hz │  + HTTPS POST   │ 1Hz│  + Reverb-WS     │
 └──────────────┘     └─────────────────┘    └──────────────────┘
-                                                       │
-                                                       ▼
-                                              ┌──────────────────┐
-                                              │ SlimHuys-dashboard│
-                                              │  realtime ~1Hz   │
-                                              └──────────────────┘
+                            ▲                          │
+                            │ /v1/bridges/claim        ▼
+                            │ (eerste setup)   ┌──────────────────┐
+                            │                  │ SlimHuys-dashboard│
+                            │                  │  realtime ~1Hz   │
+                       6-cijferige             └──────────────────┘
+                       pairing-code
+                       uit SlimHuys-app
 ```
 
 Velden die we doorzetten matchen 1-op-1 met de

@@ -10,8 +10,10 @@
  *   Built-in PHY → ethernet RJ45
  *
  * Provisioning: bij eerste boot start een captive-portal op SSID
- * "SlimHuys-Setup-XXXX" waar user zijn API-key + (optioneel) WiFi
- * configureert. Settings worden bewaard in NVS-storage.
+ * "SlimHuys-Setup-XXXX". User kiest WiFi + vult de 6-cijferige
+ * pairing-code in (uit SlimHuys-app, MijnHuis → P1-bridge koppelen).
+ * Device wisselt code in voor api-key via /v1/bridges/claim en bewaart
+ * key + base_url in NVS.
  */
 #include <Arduino.h>
 #include <ETH.h>
@@ -45,7 +47,7 @@ constexpr eth_clock_mode_t ETH_CLK = ETH_CLOCK_GPIO0_IN;
 Preferences prefs;
 HardwareSerial P1Serial(2);
 String apiKey;
-String baseUrl = SLIMHUYS_BASE_URL;
+String baseUrl;
 volatile bool ethConnected = false;
 unsigned long lastPushAt = 0;
 
@@ -104,10 +106,53 @@ String iso8601Now() {
 }
 
 // ============================================================================
+// Pairing — wissel 6-cijferige code in voor api-key
+// ============================================================================
+bool claimPairingCode(const String& code, const String& claimUrl) {
+    HTTPClient http;
+    http.begin(claimUrl);
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("User-Agent", "slimhuys-p1/" FIRMWARE_VERSION);
+
+    JsonDocument req;
+    req["code"] = code;
+    String reqBody;
+    serializeJson(req, reqBody);
+
+    int status = http.POST(reqBody);
+    String respBody = http.getString();
+    http.end();
+
+    if (status != 200) {
+        Serial.printf("Claim faalde: HTTP %d — %s\n", status, respBody.c_str());
+        return false;
+    }
+
+    JsonDocument resp;
+    DeserializationError err = deserializeJson(resp, respBody);
+    if (err) {
+        Serial.println("Claim-response parse-fout");
+        return false;
+    }
+
+    apiKey = resp["api_key"].as<String>();
+    baseUrl = resp["base_url"].as<String>();
+    if (apiKey.isEmpty() || baseUrl.isEmpty()) {
+        Serial.println("Claim-response mist api_key of base_url");
+        return false;
+    }
+
+    prefs.putString("api_key", apiKey);
+    prefs.putString("base_url", baseUrl);
+    Serial.println("Pairing succesvol — credentials bewaard");
+    return true;
+}
+
+// ============================================================================
 // Push naar SlimHuys-API
 // ============================================================================
 void pushReading(const P1Data& d) {
-    if (!networkReady() || apiKey.isEmpty()) return;
+    if (!networkReady() || apiKey.isEmpty() || baseUrl.isEmpty()) return;
 
     JsonDocument doc;
     auto readings = doc["readings"].to<JsonArray>();
@@ -177,6 +222,7 @@ void setup() {
     // Config laden uit NVS
     prefs.begin("slimhuys", false);
     apiKey = prefs.getString("api_key", "");
+    baseUrl = prefs.getString("base_url", SLIMHUYS_BASE_URL);
 
     // Network event-listener
     WiFi.onEvent(onNetworkEvent);
@@ -191,19 +237,44 @@ void setup() {
         delay(100);
     }
 
-    if (!ethConnected) {
-        Serial.println("Geen ETH — start WiFiManager portal");
+    // Geen ethernet OF nog niet ge-paired? Start captive-portal voor setup.
+    // Pairing-code-veld + WiFi-creds; api-key wordt na claim opgehaald.
+    if (!ethConnected || apiKey.isEmpty()) {
+        Serial.println("Setup-portal start (geen ETH of geen api-key)");
         WiFiManager wm;
-        WiFiManagerParameter apiKeyParam("apiKey", "SlimHuys API-key", apiKey.c_str(), 64);
-        wm.addParameter(&apiKeyParam);
+        WiFiManagerParameter codeParam(
+            "code",
+            "Pairing-code (6 cijfers, uit SlimHuys → MijnHuis)",
+            "",
+            6,
+            "pattern='[0-9]{6}' inputmode='numeric'"
+        );
+        wm.addParameter(&codeParam);
         wm.setConfigPortalTimeout(300);
-        if (wm.autoConnect("SlimHuys-Setup")) {
-            apiKey = apiKeyParam.getValue();
-            prefs.putString("api_key", apiKey);
-            Serial.println("WiFi connected");
-        } else {
+
+        // autoConnect blokkeert tot WiFi werkt of timeout. Bij geen opgeslagen
+        // creds opent 'ie automatisch het portal-AP "SlimHuys-Setup".
+        if (!wm.autoConnect("SlimHuys-Setup")) {
             Serial.println("Portal timeout — reboot in 10s");
             delay(10000);
+            ESP.restart();
+        }
+
+        // WiFi werkt — als er een code is ingevuld én we zijn nog niet
+        // gepaired, claim 'm.
+        String code = String(codeParam.getValue());
+        if (apiKey.isEmpty() && code.length() == 6) {
+            String claimUrl = String(SLIMHUYS_BASE_URL) + "/v1/bridges/claim";
+            if (!claimPairingCode(code, claimUrl)) {
+                Serial.println("Pairing faalde — reboot om opnieuw te proberen");
+                delay(5000);
+                ESP.restart();
+            }
+        }
+
+        if (apiKey.isEmpty()) {
+            Serial.println("Geen api-key na portal — reboot");
+            delay(5000);
             ESP.restart();
         }
     }
