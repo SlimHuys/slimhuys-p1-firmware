@@ -16,14 +16,18 @@
  * key + base_url in NVS.
  */
 #include <Arduino.h>
+#include <ESPmDNS.h>
 #include <ETH.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
 #include <WiFi.h>
-#include <WiFiManager.h>
 #include <dsmr.h>
 #include <time.h>
+
+#include "management.h"
+#include "portal.h"
+#include "updater.h"
 
 using namespace dsmr::fields;
 
@@ -44,10 +48,23 @@ constexpr int PUSH_INTERVAL_MS = 1000;  // Min. tijd tussen pushes (1Hz)
 // ============================================================================
 Preferences prefs;
 HardwareSerial P1Serial(2);
+ManagementInterface management;
+OtaUpdater updater;
 String apiKey;
 String baseUrl;
+String deviceHostname;
 volatile bool ethConnected = false;
 unsigned long lastPushAt = 0;
+
+// Bouwt een uniek hostname zoals "slimhuys-p1-dd4240" — laatste 3 MAC-bytes
+// als suffix zodat meerdere bridges op hetzelfde netwerk niet botsen.
+String makeHostname() {
+    uint8_t mac[6];
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    char buf[32];
+    snprintf(buf, sizeof(buf), "slimhuys-p1-%02x%02x%02x", mac[3], mac[4], mac[5]);
+    return String(buf);
+}
 
 // ============================================================================
 // DSMR-velden — zelfde shape als HACS-integration v0.4.0 + backend
@@ -72,6 +89,20 @@ P1Reader reader(&P1Serial, P1_REQUEST_PIN);
 // ============================================================================
 void onNetworkEvent(WiFiEvent_t event) {
     switch (event) {
+        case ARDUINO_EVENT_WIFI_STA_START:
+            // Hostname zetten zodra de STA-interface up is maar nog niet
+            // verbonden — Arduino-ESP32 silent-fails soms als setHostname
+            // te vroeg in setup() wordt aangeroepen.
+            if (!deviceHostname.isEmpty()) {
+                WiFi.setHostname(deviceHostname.c_str());
+            }
+            break;
+        case ARDUINO_EVENT_ETH_START:
+            // Idem voor ETH — móet vóór DHCP, anders "espressif".
+            if (!deviceHostname.isEmpty()) {
+                ETH.setHostname(deviceHostname.c_str());
+            }
+            break;
         case ARDUINO_EVENT_ETH_CONNECTED:
             Serial.println("ETH cable connected");
             break;
@@ -103,47 +134,51 @@ String iso8601Now() {
     return String(buf);
 }
 
-// ============================================================================
-// Pairing — wissel 6-cijferige code in voor api-key
-// ============================================================================
-bool claimPairingCode(const String& code, const String& claimUrl) {
-    HTTPClient http;
-    http.begin(claimUrl);
-    http.addHeader("Content-Type", "application/json");
-    http.addHeader("User-Agent", "slimhuys-p1/" FIRMWARE_VERSION);
+// Lees relevante velden voor live-display in de management-UI uit
+// een geparsd telegram. Velden die niet aanwezig zijn blijven 0 — fine
+// voor een dashboard, niet voor de API (die filtert op aanwezigheid).
+LastReading toLastReading(P1Data& d) {
+    LastReading r;
+    r.valid = true;
+    r.at_ms = millis();
 
-    JsonDocument req;
-    req["code"] = code;
-    String reqBody;
-    serializeJson(req, reqBody);
-
-    int status = http.POST(reqBody);
-    String respBody = http.getString();
-    http.end();
-
-    if (status != 200) {
-        Serial.printf("Claim faalde: HTTP %d — %s\n", status, respBody.c_str());
-        return false;
+    if (d.power_delivered_present) {
+        int consumed = (int)(d.power_delivered.val() * 1000);
+        int returned = d.power_returned_present ? (int)(d.power_returned.val() * 1000) : 0;
+        r.active_power_w = consumed - returned;
+        r.active_power_returned_w = returned;
     }
-
-    JsonDocument resp;
-    DeserializationError err = deserializeJson(resp, respBody);
-    if (err) {
-        Serial.println("Claim-response parse-fout");
-        return false;
+    if (d.voltage_l1_present) r.voltage_l1 = d.voltage_l1.val();
+    if (d.voltage_l2_present) r.voltage_l2 = d.voltage_l2.val();
+    if (d.voltage_l3_present) r.voltage_l3 = d.voltage_l3.val();
+    if (d.current_l1_present) r.current_l1_a = d.current_l1;
+    if (d.current_l2_present) r.current_l2_a = d.current_l2;
+    if (d.current_l3_present) r.current_l3_a = d.current_l3;
+    if (d.power_delivered_l1_present) r.active_power_l1_w = (int)(d.power_delivered_l1.val() * 1000);
+    if (d.power_delivered_l2_present) r.active_power_l2_w = (int)(d.power_delivered_l2.val() * 1000);
+    if (d.power_delivered_l3_present) r.active_power_l3_w = (int)(d.power_delivered_l3.val() * 1000);
+    if (d.energy_delivered_tariff1_present && d.energy_delivered_tariff2_present) {
+        r.consumption_kwh = d.energy_delivered_tariff1.val() + d.energy_delivered_tariff2.val();
     }
-
-    apiKey = resp["api_key"].as<String>();
-    baseUrl = resp["base_url"].as<String>();
-    if (apiKey.isEmpty() || baseUrl.isEmpty()) {
-        Serial.println("Claim-response mist api_key of base_url");
-        return false;
+    if (d.energy_returned_tariff1_present && d.energy_returned_tariff2_present) {
+        r.delivered_kwh = d.energy_returned_tariff1.val() + d.energy_returned_tariff2.val();
     }
+    if (d.gas_delivered_present) r.gas_m3 = d.gas_delivered.val();
+    return r;
+}
 
-    prefs.putString("api_key", apiKey);
-    prefs.putString("base_url", baseUrl);
-    Serial.println("Pairing succesvol — credentials bewaard");
-    return true;
+// Genereer of laad het admin-password (12 chars, geen verwarrende tekens)
+String getOrCreateAdminPassword() {
+    String pw = prefs.getString("admin_pass", "");
+    if (!pw.isEmpty()) return pw;
+
+    static const char charset[] = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    pw = "";
+    for (int i = 0; i < 12; i++) {
+        pw += charset[esp_random() % (sizeof(charset) - 1)];
+    }
+    prefs.putString("admin_pass", pw);
+    return pw;
 }
 
 // ============================================================================
@@ -208,6 +243,13 @@ void pushReading(P1Data& d) {
         Serial.printf("POST faalde: HTTP %d\n", code);
     }
     http.end();
+    management.recordPush(code);
+
+    // Eerste succesvolle push = signaal dat deze firmware werkt; voorkom
+    // bootloader-rollback naar de vorige versie. No-op als geen pending OTA.
+    if (code == 202 || code == 200) {
+        updater.markValid();
+    }
 }
 
 // ============================================================================
@@ -224,63 +266,83 @@ void setup() {
     apiKey = prefs.getString("api_key", "");
     baseUrl = prefs.getString("base_url", SLIMHUYS_BASE_URL);
 
-    // Network event-listener
+    // Hostname opbouwen vóór WiFi/ETH starten — anders kondigt 't bord
+    // zich aan als "esp32-XXXXXX" / "espressif" in de DHCP-tabel.
+    deviceHostname = makeHostname();
+    Serial.printf("Hostname: %s\n", deviceHostname.c_str());
+
+    // Network event-listener (set ETH hostname op ETH_START)
     WiFi.onEvent(onNetworkEvent);
 
-    // Ethernet-eerst, WiFi-fallback. Board-variant levert alle ETH_*-pins.
+    // STA-mode initialiseren + hostname zetten — vóór WiFi.begin() (saved
+    // creds én later in het portal). Hostname blijft sticky over begin/disconnect.
+    WiFi.mode(WIFI_STA);
+    WiFi.setHostname(deviceHostname.c_str());
+
+    // Modem-sleep uit: dit is een wired-power device, dus de ~30mA
+    // besparing weegt niet op tegen de WiFi-stabiliteit (voorkomt random
+    // NOT_AUTHED-disconnects op DTIM-grenzen).
+    WiFi.setSleep(false);
+
+    // Probeer opgeslagen WiFi-creds (parallel aan ethernet — wat 't eerst
+    // up is, wordt gebruikt). Bij eerste boot zijn deze leeg → no-op.
+    String savedSsid = prefs.getString("wifi_ssid", "");
+    String savedPass = prefs.getString("wifi_pass", "");
+    if (!savedSsid.isEmpty()) {
+        Serial.printf("WiFi reconnect: %s\n", savedSsid.c_str());
+        WiFi.begin(savedSsid.c_str(), savedPass.c_str());
+    }
+
+    // Ethernet starten — kabel-detectie is async via onNetworkEvent
     Serial.println("ETH start…");
     ETH.begin();
 
-    // 5s wachten op ethernet, anders WiFi-portal
-    unsigned long ethDeadline = millis() + 5000;
-    while (!ethConnected && millis() < ethDeadline) {
+    // 10s wachten tot ETH óf WiFi up is
+    unsigned long deadline = millis() + 10000;
+    while (millis() < deadline && !networkReady()) {
         delay(100);
     }
 
-    // Geen ethernet OF nog niet ge-paired? Start captive-portal voor setup.
-    // Pairing-code-veld + WiFi-creds; api-key wordt na claim opgehaald.
-    if (!ethConnected || apiKey.isEmpty()) {
-        Serial.println("Setup-portal start (geen ETH of geen api-key)");
-        WiFiManager wm;
-        WiFiManagerParameter codeParam(
-            "code",
-            "Pairing-code (6 cijfers, uit SlimHuys → MijnHuis)",
-            "",
-            6,
-            "pattern='[0-9]{6}' inputmode='numeric'"
-        );
-        wm.addParameter(&codeParam);
-        wm.setConfigPortalTimeout(300);
-
-        // autoConnect blokkeert tot WiFi werkt of timeout. Bij geen opgeslagen
-        // creds opent 'ie automatisch het portal-AP "SlimHuys-Setup".
-        if (!wm.autoConnect("SlimHuys-Setup")) {
-            Serial.println("Portal timeout — reboot in 10s");
-            delay(10000);
-            ESP.restart();
-        }
-
-        // WiFi werkt — als er een code is ingevuld én we zijn nog niet
-        // gepaired, claim 'm.
-        String code = String(codeParam.getValue());
-        if (apiKey.isEmpty() && code.length() == 6) {
-            String claimUrl = String(SLIMHUYS_BASE_URL) + "/v1/bridges/claim";
-            if (!claimPairingCode(code, claimUrl)) {
-                Serial.println("Pairing faalde — reboot om opnieuw te proberen");
-                delay(5000);
-                ESP.restart();
-            }
-        }
-
-        if (apiKey.isEmpty()) {
-            Serial.println("Geen api-key na portal — reboot");
+    // Geen netwerk OF nog niet ge-paired? Start captive-portal voor setup.
+    if (!networkReady() || apiKey.isEmpty()) {
+        Serial.println("Captive portal start (geen netwerk of geen api-key)");
+        CaptivePortal portal;
+        String claimUrl = String(SLIMHUYS_BASE_URL) + "/v1/bridges/claim";
+        if (!portal.run("SlimHuys-Setup", claimUrl)) {
+            Serial.println("Portal timeout/error — reboot in 5s");
             delay(5000);
             ESP.restart();
         }
+
+        apiKey = portal.apiKey();
+        baseUrl = portal.baseUrl();
+        prefs.putString("api_key", apiKey);
+        prefs.putString("base_url", baseUrl);
+        prefs.putString("wifi_ssid", portal.ssid());
+        prefs.putString("wifi_pass", portal.password());
+        Serial.println("Credentials bewaard in NVS");
     }
 
     // NTP voor ISO-timestamps
     configTzTime("CET-1CEST,M3.5.0/2,M10.5.0/3", "pool.ntp.org");
+
+    // mDNS — bridge bereikbaar op http://<hostname>.local/
+    if (MDNS.begin(deviceHostname.c_str())) {
+        MDNS.addService("http", "tcp", 80);
+        Serial.printf("mDNS: http://%s.local/\n", deviceHostname.c_str());
+    }
+
+    // Admin-password voor management-UI (basic auth op gevaarlijke endpoints)
+    String adminPass = getOrCreateAdminPassword();
+
+    // OTA-updater — periodiek check naar /v1/firmware/manifest
+    updater.begin(baseUrl, apiKey, FIRMWARE_VERSION);
+
+    // Lokale management-interface (status + reset-knoppen + OTA)
+    management.begin(&prefs, FIRMWARE_VERSION, adminPass, &updater);
+    Serial.printf("Management UI: http://%s/\n",
+        ethConnected ? ETH.localIP().toString().c_str() : WiFi.localIP().toString().c_str());
+    Serial.printf("  ↳ login: admin / %s\n", adminPass.c_str());
 
     // P1-UART: 115200 8N1, RX-only (data komt naar ons toe)
     P1Serial.begin(115200, SERIAL_8N1, P1_RX_PIN, -1);
@@ -290,12 +352,16 @@ void setup() {
 }
 
 void loop() {
+    management.loop();
+    updater.loop();
     reader.loop();
 
     if (reader.available()) {
         P1Data data;
         String error;
         if (reader.parse(&data, &error)) {
+            management.recordParse(true);
+            management.setLastReading(toLastReading(data));
             unsigned long now = millis();
             if (now - lastPushAt >= PUSH_INTERVAL_MS) {
                 pushReading(data);
@@ -304,6 +370,7 @@ void loop() {
         } else {
             Serial.print("Parse-fout: ");
             Serial.println(error);
+            management.recordParse(false, error);
         }
         reader.enable(true);  // klaar voor volgende telegram
     }
