@@ -31,15 +31,24 @@ void ManagementInterface::recordPush(int httpStatus) {
     else _pushFail++;
 }
 
+void ManagementInterface::recordWaterPush(int httpStatus) {
+    _lastWaterPushStatus = httpStatus;
+    _lastWaterPushAt = millis();
+    if (httpStatus == 202 || httpStatus == 200) _waterPushOk++;
+    else _waterPushFail++;
+}
+
 void ManagementInterface::recordParse(bool ok, const String& error) {
     _lastParseOk = ok;
     _lastParseAt = millis();
     if (ok) {
         _parseOk++;
         _lastParseError = "";
+        _consecutiveParseFails = 0;
     } else {
         _parseFail++;
         _lastParseError = error;
+        _consecutiveParseFails++;
     }
 }
 
@@ -97,6 +106,7 @@ void ManagementInterface::_handleStatus() {
     p1["last_parse_error"] = _lastParseError;
     p1["parse_ok_count"] = _parseOk;
     p1["parse_fail_count"] = _parseFail;
+    p1["consecutive_parse_fails"] = _consecutiveParseFails;
     p1["bytes_observed"] = p1BytesObserved;
 
     JsonObject api = doc["api"].to<JsonObject>();
@@ -104,6 +114,12 @@ void ManagementInterface::_handleStatus() {
     api["last_at_ms_ago"] = _lastPushAt > 0 ? (long)(millis() - _lastPushAt) : -1;
     api["push_ok_count"] = _pushOk;
     api["push_fail_count"] = _pushFail;
+
+    JsonObject water = doc["water"].to<JsonObject>();
+    water["last_status"] = _lastWaterPushStatus;
+    water["last_at_ms_ago"] = _lastWaterPushAt > 0 ? (long)(millis() - _lastWaterPushAt) : -1;
+    water["push_ok_count"] = _waterPushOk;
+    water["push_fail_count"] = _waterPushFail;
 
     if (_updater) {
         JsonObject ota = doc["ota"].to<JsonObject>();
@@ -131,6 +147,7 @@ void ManagementInterface::_handleStatus() {
         reading["consumption_kwh"] = _lastReading.consumption_kwh;
         reading["delivered_kwh"] = _lastReading.delivered_kwh;
         reading["gas_m3"] = _lastReading.gas_m3;
+        reading["water_l_total"] = _lastReading.water_l_total;
     }
 
     String body;
@@ -443,6 +460,10 @@ const char MANAGEMENT_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
       <div class="row-label">Gas totaal</div>
       <div class="row-value" id="gas">—</div>
     </div>
+    <div class="row">
+      <div class="row-label">Water totaal</div>
+      <div class="row-value" id="water">—</div>
+    </div>
   </div>
 
   <h2>Status</h2>
@@ -464,8 +485,12 @@ const char MANAGEMENT_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
       <div class="row-value" id="p1">…</div>
     </div>
     <div class="row">
-      <div class="row-label">Laatste push</div>
+      <div class="row-label">P1 push</div>
       <div class="row-value" id="api">…</div>
+    </div>
+    <div class="row">
+      <div class="row-label">Water push</div>
+      <div class="row-value" id="water-api">…</div>
     </div>
     <div class="row">
       <div class="row-label">Uptime</div>
@@ -554,22 +579,25 @@ function refresh() {
       p1El.innerHTML = dot('idle') + 'Geen telegram ontvangen';
     } else if (p.last_parse_at_ms_ago > 5000) {
       p1El.innerHTML = dot('warn') + 'Stil sinds ' + fmtAgo(p.last_parse_at_ms_ago);
-    } else if (p.last_parse_ok) {
-      p1El.innerHTML = dot('ok') + p.parse_ok_count + ' OK · ' + p.parse_fail_count + ' fout';
-    } else {
+    } else if ((p.consecutive_parse_fails || 0) >= 3) {
+      // Pas rood na 3 fails op rij — voorkomt flikker bij occasionele DSMR-glitches
       p1El.innerHTML = dot('err') + 'Parse-fout: ' + (p.last_parse_error || '?');
+    } else {
+      p1El.innerHTML = dot('ok') + p.parse_ok_count + ' OK · ' + p.parse_fail_count + ' fout';
     }
 
-    var a = d.api;
-    var apiEl = document.getElementById('api');
-    if (a.last_at_ms_ago < 0) {
-      apiEl.innerHTML = dot('idle') + 'Nog niet gepusht';
-    } else {
-      var ok = (a.last_status === 200 || a.last_status === 202);
-      apiEl.innerHTML = dot(ok ? 'ok' : 'err')
-        + 'HTTP ' + a.last_status + ' · ' + fmtAgo(a.last_at_ms_ago)
-        + ' (' + a.push_ok_count + '/' + (a.push_ok_count + a.push_fail_count) + ')';
+    function renderPush(el, x, idleLabel) {
+      if (x.last_at_ms_ago < 0) {
+        el.innerHTML = dot('idle') + idleLabel;
+        return;
+      }
+      var ok = (x.last_status === 200 || x.last_status === 202);
+      el.innerHTML = dot(ok ? 'ok' : 'err')
+        + 'HTTP ' + x.last_status + ' · ' + fmtAgo(x.last_at_ms_ago)
+        + ' (' + x.push_ok_count + '/' + (x.push_ok_count + x.push_fail_count) + ')';
     }
+    renderPush(document.getElementById('api'),       d.api,   'Nog niet gepusht');
+    renderPush(document.getElementById('water-api'), d.water, 'Nog niet gepusht');
 
     document.getElementById('uptime').textContent = fmtUptime(d.uptime_s);
     document.getElementById('version').textContent = 'v' + d.version;
@@ -605,6 +633,11 @@ function refresh() {
       document.getElementById('kwh-cons').textContent = fmtNum(r.consumption_kwh, 3) + ' kWh';
       document.getElementById('kwh-del').textContent = fmtNum(r.delivered_kwh, 3) + ' kWh';
       document.getElementById('gas').textContent = r.gas_m3 ? (fmtNum(r.gas_m3, 3) + ' m³') : '—';
+      // Water: ESP32 telt liters; toon als L < 1000, anders m³
+      var waterL = r.water_l_total || 0;
+      document.getElementById('water').textContent = waterL < 1000
+        ? (fmtNum(waterL, 0) + ' L')
+        : (fmtNum(waterL / 1000, 3) + ' m³');
     } else {
       bigEl.textContent = '—';
       bigEl.className = 'big-value idle';

@@ -35,6 +35,7 @@ struct LastReading {
     float consumption_kwh = 0;
     float delivered_kwh = 0;
     float gas_m3 = 0;
+    uint32_t water_l_total = 0;       // cumulatief sinds NVS-init
 };
 
 class ManagementInterface {
@@ -45,6 +46,7 @@ public:
 
     // Telemetrie-hooks vanuit main-loop
     void recordPush(int httpStatus);
+    void recordWaterPush(int httpStatus);
     void recordParse(bool ok, const String& error = String());
     void setLastReading(const LastReading& r) { _lastReading = r; }
 
@@ -72,11 +74,19 @@ private:
     uint32_t _pushOk = 0;
     uint32_t _pushFail = 0;
 
+    int _lastWaterPushStatus = 0;
+    unsigned long _lastWaterPushAt = 0;
+    uint32_t _waterPushOk = 0;
+    uint32_t _waterPushFail = 0;
+
     bool _lastParseOk = true;
     String _lastParseError;
     unsigned long _lastParseAt = 0;
     uint32_t _parseOk = 0;
     uint32_t _parseFail = 0;
+    // Consecutieve fails — UI toont pas rood na ≥3, voorkomt flikker bij
+    // occasionele DSMR-glitches (1 telegram per 20s mist is normaal).
+    uint32_t _consecutiveParseFails = 0;
 
     LastReading _lastReading;
 };

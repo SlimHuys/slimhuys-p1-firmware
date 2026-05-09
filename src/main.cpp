@@ -1,13 +1,15 @@
 /**
  * SlimHuys P1-bridge firmware
  * --------------------------
- * Leest DSMR-telegrammen via UART, pusht naar SlimHuys' /v1/me/readings
- * endpoint over ethernet (LAN8720 + PoE) of WiFi-fallback.
+ * Leest DSMR-telegrammen via UART + telt water-pulses op GPIO32, pusht
+ * beide naar SlimHuys' /v1/me/readings + /v1/me/water-readings over
+ * ethernet (LAN8720 + PoE) of WiFi-fallback.
  *
  * Pin-mapping (smarthomeshop WaterP1MeterKit V3):
  *   GPIO 16 ← P1-data (software-inverted UART, geen NPN nodig)
  *   GPIO 12 → P1-request (data-trigger naar slimme meter)
  *   GPIO 13 → groene LED van de RGB-indicator (ETH-status)
+ *   GPIO 32 ← water-pulse (reed-switch, 1 puls = 1L default)
  *   LAN8720 PHY → ethernet RJ45 (MDC=23, MDIO=18, CLK=17_OUT, PWR=33, addr=1)
  *
  * Provisioning: bij eerste boot start een captive-portal op SSID
@@ -39,7 +41,13 @@ using namespace dsmr::fields;
 constexpr int P1_RX_PIN = 16;       // DSMR-data (software-inverted UART)
 constexpr int P1_REQUEST_PIN = 12;  // Data-trigger naar slimme meter (DTR)
 constexpr int LED_PIN = 13;         // Groene kanaal van de RGB-indicator
-constexpr int PUSH_INTERVAL_MS = 1000;  // Min. tijd tussen pushes (1Hz)
+constexpr int WATER_PULSE_PIN = 32; // Reed-switch op water-meter
+constexpr int PUSH_INTERVAL_MS = 1000;        // P1: 1Hz
+constexpr int WATER_PUSH_INTERVAL_MS = 60000; // Water: 1×/min ruim genoeg
+constexpr unsigned long WATER_DEBOUNCE_US = 50000; // 50ms reed-switch debounce
+#ifndef LITERS_PER_PULSE
+#define LITERS_PER_PULSE 1
+#endif
 
 // LAN8720 PHY — esp32dev heeft geen ETH_PHY_*-macro's, dus expliciete args
 // aan ETH.begin() (zie setup()). Pin-keuze komt uit smarthomeshop V3 eth.yaml.
@@ -56,11 +64,26 @@ String baseUrl;
 String deviceHostname;
 volatile bool ethConnected = false;
 unsigned long lastPushAt = 0;
+unsigned long lastWaterPushAt = 0;
 
 // Diagnostiek: hoeveel bytes hebben we überhaupt op de UART zien
 // langskomen (telt vóór reader 'r consumeert). Bridge → UART-pin → level
 // converter chain debuggen.
 uint32_t p1BytesObserved = 0;
+
+// Water-pulse counter (cumulatief sinds NVS-init). Geschreven door ISR,
+// gelezen door main-loop. uint32_t is single-instruction load/store op
+// xtensa, dus geen explicit lock nodig.
+volatile uint32_t waterPulseCount = 0;
+volatile unsigned long lastPulseUs = 0;
+
+void IRAM_ATTR onWaterPulse() {
+    unsigned long now = micros();
+    // Reed-switches bouncen ~10-30ms — we negeren transitions binnen 50ms.
+    if (now - lastPulseUs < WATER_DEBOUNCE_US) return;
+    lastPulseUs = now;
+    waterPulseCount++;
+}
 
 // Bouwt een uniek hostname zoals "slimhuys-p1-dd4240" — laatste 3 MAC-bytes
 // als suffix zodat meerdere bridges op hetzelfde netwerk niet botsen.
@@ -137,7 +160,14 @@ String iso8601Now() {
     localtime_r(&now, &tm);
     char buf[32];
     strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S%z", &tm);
-    return String(buf);
+    String s(buf);
+    // %z geeft "+0200" (RFC822); SlimHuys-validator wil "+02:00" (ISO 8601
+    // strict) — colon in de TZ-suffix schuiven.
+    int len = s.length();
+    if (len >= 5 && (s[len - 5] == '+' || s[len - 5] == '-')) {
+        s = s.substring(0, len - 2) + ":" + s.substring(len - 2);
+    }
+    return s;
 }
 
 // Lees relevante velden voor live-display in de management-UI uit
@@ -170,6 +200,7 @@ LastReading toLastReading(P1Data& d) {
         r.delivered_kwh = d.energy_returned_tariff1.val() + d.energy_returned_tariff2.val();
     }
     if (d.gas_delivered_present) r.gas_m3 = d.gas_delivered.val();
+    r.water_l_total = waterPulseCount * (uint32_t)LITERS_PER_PULSE;
     return r;
 }
 
@@ -259,6 +290,44 @@ void pushReading(P1Data& d) {
 }
 
 // ============================================================================
+// Push naar SlimHuys-API — water (cumulatieve liter-stand)
+// ============================================================================
+void pushWaterReading() {
+    if (!networkReady() || apiKey.isEmpty() || baseUrl.isEmpty()) return;
+
+    uint32_t total_l = waterPulseCount * (uint32_t)LITERS_PER_PULSE;
+
+    JsonDocument doc;
+    auto readings = doc["readings"].to<JsonArray>();
+    auto r = readings.add<JsonObject>();
+    r["timestamp"] = iso8601Now();
+    r["total_liter"] = total_l;
+
+    String payload;
+    serializeJson(doc, payload);
+
+    HTTPClient http;
+    http.begin(baseUrl + "/v1/me/water-readings");
+    http.addHeader("Authorization", "Bearer " + apiKey);
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("User-Agent", "slimhuys-p1/" FIRMWARE_VERSION);
+
+    int code = http.POST(payload);
+    if (code != 202 && code != 200) {
+        Serial.printf("Water-POST faalde: HTTP %d\n", code);
+    }
+    http.end();
+    management.recordWaterPush(code);
+
+    // Persisteer de teller pas na succesvolle push — voorkomt dat we bij
+    // power-loss vlak na een mislukte push de "verloren" pulses dubbel
+    // tellen wanneer backend ze later alsnog ontvangt.
+    if (code == 202 || code == 200) {
+        prefs.putUInt("water_l", waterPulseCount);
+    }
+}
+
+// ============================================================================
 // Setup + loop
 // ============================================================================
 void setup() {
@@ -271,6 +340,13 @@ void setup() {
     prefs.begin("slimhuys", false);
     apiKey = prefs.getString("api_key", "");
     baseUrl = prefs.getString("base_url", SLIMHUYS_BASE_URL);
+    waterPulseCount = prefs.getUInt("water_l", 0);
+    Serial.printf("Water-counter geladen: %u L\n", (unsigned)waterPulseCount);
+
+    // Pulse-input: pull-up + falling edge ISR. Doen we vroeg in setup() zodat
+    // pulses tijdens captive-portal of NTP-sync niet verloren gaan.
+    pinMode(WATER_PULSE_PIN, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(WATER_PULSE_PIN), onWaterPulse, FALLING);
 
     // Hostname opbouwen vóór WiFi/ETH starten — anders kondigt 't bord
     // zich aan als "esp32-XXXXXX" / "espressif" in de DHCP-tabel.
@@ -365,6 +441,9 @@ void setup() {
     // P1-UART: 115200 8N1, RX-only (data komt naar ons toe).
     // Software-invert i.p.v. een NPN-inverter — moet ná begin() omdat
     // begin() de UART opnieuw configureert en de invert-flag overschrijft.
+    // RX-buffer 2048B: DSMR 5.0-telegrammen kunnen ~900B groot zijn, default
+    // 256B kan onder load overlopen en parses afbreken.
+    P1Serial.setRxBufferSize(2048);
     P1Serial.begin(115200, SERIAL_8N1, P1_RX_PIN, -1);
     uart_set_line_inverse(UART_NUM_2, UART_SIGNAL_RXD_INV);
     reader.enable(true);
@@ -375,6 +454,14 @@ void setup() {
 void loop() {
     management.loop();
     updater.loop();
+
+    // Water-push: 1×/min ongeacht P1-state. Cumulatieve waarde dus gemiste
+    // pushes worden automatisch ingehaald — geen retry-buffer nodig.
+    unsigned long now = millis();
+    if (now - lastWaterPushAt >= WATER_PUSH_INTERVAL_MS) {
+        pushWaterReading();
+        lastWaterPushAt = now;
+    }
 
     // Diagnostiek: tel bytes vóór reader 'r consumeert
     int avail = P1Serial.available();
@@ -390,7 +477,6 @@ void loop() {
         if (reader.parse(&data, &error)) {
             management.recordParse(true);
             management.setLastReading(toLastReading(data));
-            unsigned long now = millis();
             if (now - lastPushAt >= PUSH_INTERVAL_MS) {
                 pushReading(data);
                 lastPushAt = now;
