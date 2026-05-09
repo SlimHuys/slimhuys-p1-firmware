@@ -290,6 +290,48 @@ void pushReading(P1Data& d) {
 }
 
 // ============================================================================
+// Push naar SlimHuys-API — management-info (LAN-IP + admin-creds)
+// ----------------------------------------------------------------------------
+// Idempotent: 1× na pairing, daarna alleen wanneer IP veranderd t.o.v.
+// laatst-uploaded waarde (DHCP-lease-rotation, kabelwissel, etc.).
+// SPA gebruikt dit om de "Toon gegevens"-knop in Mijn Huis te vullen.
+// ============================================================================
+void pushManagementInfo() {
+    if (!networkReady() || apiKey.isEmpty() || baseUrl.isEmpty()) return;
+
+    String currentIp = ethConnected ? ETH.localIP().toString() : WiFi.localIP().toString();
+    String lastIp = prefs.getString("mgmt_ip", "");
+    if (currentIp == lastIp) return;  // niets veranderd, skip de roundtrip
+
+    String adminPass = prefs.getString("admin_pass", "");
+    if (adminPass.isEmpty()) return;  // defensief — getOrCreateAdminPassword()
+                                      // had 'm allang aangemaakt
+
+    JsonDocument doc;
+    doc["host"] = currentIp;
+    doc["username"] = "admin";
+    doc["password"] = adminPass;
+
+    String payload;
+    serializeJson(doc, payload);
+
+    HTTPClient http;
+    http.begin(baseUrl + "/v1/me/bridges/management");
+    http.addHeader("Authorization", "Bearer " + apiKey);
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("User-Agent", "slimhuys-p1/" FIRMWARE_VERSION);
+
+    int code = http.PUT(payload);
+    http.end();
+
+    Serial.printf("Management-info PUT: HTTP %d (host=%s)\n", code, currentIp.c_str());
+
+    if (code == 204 || code == 200) {
+        prefs.putString("mgmt_ip", currentIp);
+    }
+}
+
+// ============================================================================
 // Push naar SlimHuys-API — water (cumulatieve liter-stand)
 // ============================================================================
 void pushWaterReading() {
@@ -437,6 +479,10 @@ void setup() {
     Serial.printf("Management UI: http://%s/\n",
         ethConnected ? ETH.localIP().toString().c_str() : WiFi.localIP().toString().c_str());
     Serial.printf("  ↳ login: admin / %s\n", adminPass.c_str());
+
+    // Upload host+creds naar SlimHuys zodat de SPA "Toon gegevens" kan tonen.
+    // Idempotent — interne check skipt als IP onveranderd is t.o.v. NVS.
+    pushManagementInfo();
 
     // P1-UART: 115200 8N1, RX-only (data komt naar ons toe).
     // Software-invert i.p.v. een NPN-inverter — moet ná begin() omdat
