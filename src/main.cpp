@@ -42,8 +42,10 @@ constexpr int P1_RX_PIN = 16;       // DSMR-data (software-inverted UART)
 constexpr int P1_REQUEST_PIN = 12;  // Data-trigger naar slimme meter (DTR)
 constexpr int LED_PIN = 13;         // Groene kanaal van de RGB-indicator
 constexpr int WATER_PULSE_PIN = 32; // Reed-switch op water-meter
-constexpr int PUSH_INTERVAL_MS = 1000;        // P1: 1Hz
-constexpr int WATER_PUSH_INTERVAL_MS = 60000; // Water: 1×/min ruim genoeg
+constexpr int PUSH_INTERVAL_MS = 1000;             // P1: 1Hz
+constexpr int WATER_PUSH_THROTTLE_MS = 1000;       // Water: max 1Hz bij verandering
+constexpr int WATER_PUSH_HEARTBEAT_MS = 60000;     // Water: periodiek ook bij stilstand
+constexpr unsigned long WATER_PERSIST_INTERVAL_MS = 5UL * 60UL * 1000UL; // NVS-write throttle
 constexpr unsigned long WATER_DEBOUNCE_US = 50000; // 50ms reed-switch debounce
 #ifndef LITERS_PER_PULSE
 #define LITERS_PER_PULSE 1
@@ -65,6 +67,11 @@ String deviceHostname;
 volatile bool ethConnected = false;
 unsigned long lastPushAt = 0;
 unsigned long lastWaterPushAt = 0;
+unsigned long lastWaterPersistAt = 0;
+// Sentinel UINT32_MAX zodat de eerste vergelijking altijd "changed" zegt
+// en de eerste push dus direct vuurt op boot.
+uint32_t lastPushedTotal = 0xFFFFFFFFu;
+uint32_t lastPersistedTotal = 0;
 
 // Diagnostiek: hoeveel bytes hebben we überhaupt op de UART zien
 // langskomen (telt vóór reader 'r consumeert). Bridge → UART-pin → level
@@ -333,11 +340,13 @@ void pushManagementInfo() {
 
 // ============================================================================
 // Push naar SlimHuys-API — water (cumulatieve liter-stand)
+// ----------------------------------------------------------------------------
+// Aanroeper bepaalt total_l (gesnapshot vóór de call zodat ISR-races niet
+// tussen decision en payload kunnen optreden). Op success update lastPushedTotal
+// in RAM — NVS-persist gebeurt los, op een eigen ~5min-cadens.
 // ============================================================================
-void pushWaterReading() {
+void pushWaterReading(uint32_t total_l) {
     if (!networkReady() || apiKey.isEmpty() || baseUrl.isEmpty()) return;
-
-    uint32_t total_l = waterPulseCount * (uint32_t)LITERS_PER_PULSE;
 
     JsonDocument doc;
     auto readings = doc["readings"].to<JsonArray>();
@@ -361,11 +370,8 @@ void pushWaterReading() {
     http.end();
     management.recordWaterPush(code);
 
-    // Persisteer de teller pas na succesvolle push — voorkomt dat we bij
-    // power-loss vlak na een mislukte push de "verloren" pulses dubbel
-    // tellen wanneer backend ze later alsnog ontvangt.
     if (code == 202 || code == 200) {
-        prefs.putUInt("water_l", waterPulseCount);
+        lastPushedTotal = total_l;
     }
 }
 
@@ -383,6 +389,7 @@ void setup() {
     apiKey = prefs.getString("api_key", "");
     baseUrl = prefs.getString("base_url", SLIMHUYS_BASE_URL);
     waterPulseCount = prefs.getUInt("water_l", 0);
+    lastPersistedTotal = waterPulseCount;  // start in sync met NVS
     Serial.printf("Water-counter geladen: %u L\n", (unsigned)waterPulseCount);
 
     // Pulse-input: pull-up + falling edge ISR. Doen we vroeg in setup() zodat
@@ -501,12 +508,25 @@ void loop() {
     management.loop();
     updater.loop();
 
-    // Water-push: 1×/min ongeacht P1-state. Cumulatieve waarde dus gemiste
-    // pushes worden automatisch ingehaald — geen retry-buffer nodig.
+    // Water-push: change-driven met 1Hz throttle, plus 60s heartbeat. Geeft
+    // snelle UI-feedback bij stromend water zonder push-storm bij heavy flow,
+    // en zorgt dat backend ook bij stilstand periodiek bevestigd ziet "alive".
     unsigned long now = millis();
-    if (now - lastWaterPushAt >= WATER_PUSH_INTERVAL_MS) {
-        pushWaterReading();
+    uint32_t total_l = waterPulseCount * (uint32_t)LITERS_PER_PULSE;
+    bool waterChanged = (total_l != lastPushedTotal);
+    unsigned long sinceWaterPush = now - lastWaterPushAt;
+    if ((waterChanged && sinceWaterPush >= WATER_PUSH_THROTTLE_MS)
+            || sinceWaterPush >= WATER_PUSH_HEARTBEAT_MS) {
+        pushWaterReading(total_l);
         lastWaterPushAt = now;
+    }
+
+    // NVS-persist los van push: max 1×/5min en alleen als waarde gewijzigd.
+    // Beschermt flash bij heavy flow (bv. bad-vullen = 1 puls/sec ×10min).
+    if (total_l != lastPersistedTotal && now - lastWaterPersistAt >= WATER_PERSIST_INTERVAL_MS) {
+        prefs.putUInt("water_l", total_l);
+        lastPersistedTotal = total_l;
+        lastWaterPersistAt = now;
     }
 
     // Diagnostiek: tel bytes vóór reader 'r consumeert
