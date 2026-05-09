@@ -292,14 +292,9 @@ const char MANAGEMENT_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
   .wrap { max-width: 460px; margin: 0 auto; }
   header { text-align: center; padding: 24px 0 16px; }
   .logo {
-    width: 48px; height: 48px;
-    background: var(--primary);
-    border-radius: 12px;
-    display: inline-flex; align-items: center; justify-content: center;
+    height: 40px;
+    width: auto;
     margin-bottom: 12px;
-    color: white;
-    font-size: 22px; font-weight: 700;
-    letter-spacing: -0.02em;
   }
   h1 { font-size: 22px; margin: 0 0 4px; letter-spacing: -0.02em; }
   .subtitle { color: var(--muted); font-size: 14px; margin: 0; }
@@ -434,7 +429,7 @@ const char MANAGEMENT_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
 <body>
 <div class="wrap">
   <header>
-    <div class="logo">S</div>
+    <svg class="logo" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 260 56" role="img" aria-label="SlimHuys.nl"><g transform="translate(4,4)"><rect x="8" y="30" width="6" height="12" rx="1.5" fill="#B8EBD2"/><rect x="16.67" y="26" width="6" height="16" rx="1.5" fill="#4FCB8E"/><rect x="25.33" y="22" width="6" height="20" rx="1.5" fill="#22B36B"/><rect x="34" y="20" width="6" height="22" rx="1.5" fill="#0E7A47"/><path d="M 4 20 L 24 6 L 44 20" fill="none" stroke="#042E1D" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/></g><text x="64" y="37" font-family="-apple-system,'Segoe UI',system-ui,sans-serif" font-size="26" font-weight="500" letter-spacing="-0.4"><tspan fill="#042E1D">Slim</tspan><tspan fill="#0E7A47">Huys</tspan><tspan fill="#4FCB8E" font-weight="400">.nl</tspan></text></svg>
     <h1>P1-bridge</h1>
     <p class="subtitle">Status &amp; beheer</p>
   </header>
