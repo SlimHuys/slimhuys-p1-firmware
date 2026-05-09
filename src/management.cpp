@@ -5,6 +5,9 @@
 #include <Update.h>
 #include <WiFi.h>
 
+// Diagnostiek-counter uit main.cpp — telt bytes op P1-UART
+extern uint32_t p1BytesObserved;
+
 extern const char MANAGEMENT_HTML[] PROGMEM;
 
 void ManagementInterface::begin(Preferences* prefs, const String& version,
@@ -94,6 +97,7 @@ void ManagementInterface::_handleStatus() {
     p1["last_parse_error"] = _lastParseError;
     p1["parse_ok_count"] = _parseOk;
     p1["parse_fail_count"] = _parseFail;
+    p1["bytes_observed"] = p1BytesObserved;
 
     JsonObject api = doc["api"].to<JsonObject>();
     api["last_status"] = _lastPushStatus;

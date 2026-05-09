@@ -2,12 +2,13 @@
  * SlimHuys P1-bridge firmware
  * --------------------------
  * Leest DSMR-telegrammen via UART, pusht naar SlimHuys' /v1/me/readings
- * endpoint over ethernet (WT32-ETH01) of WiFi-fallback.
+ * endpoint over ethernet (LAN8720 + PoE) of WiFi-fallback.
  *
- * Pin-mapping (WT32-ETH01):
- *   GPIO 5  ← P1-data via NPN-inverter (zie README)
- *   GPIO 33 → P1-request (data-trigger naar slimme meter)
- *   Built-in PHY → ethernet RJ45
+ * Pin-mapping (smarthomeshop WaterP1MeterKit V3):
+ *   GPIO 16 ← P1-data (software-inverted UART, geen NPN nodig)
+ *   GPIO 12 → P1-request (data-trigger naar slimme meter)
+ *   GPIO 13 → groene LED van de RGB-indicator (ETH-status)
+ *   LAN8720 PHY → ethernet RJ45 (MDC=23, MDIO=18, CLK=17_OUT, PWR=33, addr=1)
  *
  * Provisioning: bij eerste boot start een captive-portal op SSID
  * "SlimHuys-Setup-XXXX". User kiest WiFi + vult de 6-cijferige
@@ -23,6 +24,7 @@
 #include <Preferences.h>
 #include <WiFi.h>
 #include <dsmr.h>
+#include <driver/uart.h>
 #include <time.h>
 
 #include "management.h"
@@ -34,14 +36,13 @@ using namespace dsmr::fields;
 // ============================================================================
 // Configuration
 // ============================================================================
-constexpr int P1_RX_PIN = 5;        // DSMR-data uit NPN-inverter
-constexpr int P1_REQUEST_PIN = 33;  // Data-trigger naar slimme meter (DTR)
-constexpr int LED_PIN = 2;          // Status-LED (built-in op WT32-ETH01)
+constexpr int P1_RX_PIN = 16;       // DSMR-data (software-inverted UART)
+constexpr int P1_REQUEST_PIN = 12;  // Data-trigger naar slimme meter (DTR)
+constexpr int LED_PIN = 13;         // Groene kanaal van de RGB-indicator
 constexpr int PUSH_INTERVAL_MS = 1000;  // Min. tijd tussen pushes (1Hz)
 
-// Ethernet config: WT32-ETH01-board-variant defineert ETH_PHY_ADDR /
-// ETH_PHY_POWER / ETH_PHY_MDC / ETH_PHY_MDIO als macros die we hieronder
-// hergebruiken via `ETH.begin()` zonder explicit args.
+// LAN8720 PHY — esp32dev heeft geen ETH_PHY_*-macro's, dus expliciete args
+// aan ETH.begin() (zie setup()). Pin-keuze komt uit smarthomeshop V3 eth.yaml.
 
 // ============================================================================
 // State
@@ -55,6 +56,11 @@ String baseUrl;
 String deviceHostname;
 volatile bool ethConnected = false;
 unsigned long lastPushAt = 0;
+
+// Diagnostiek: hoeveel bytes hebben we überhaupt op de UART zien
+// langskomen (telt vóór reader 'r consumeert). Bridge → UART-pin → level
+// converter chain debuggen.
+uint32_t p1BytesObserved = 0;
 
 // Bouwt een uniek hostname zoals "slimhuys-p1-dd4240" — laatste 3 MAC-bytes
 // als suffix zodat meerdere bridges op hetzelfde netwerk niet botsen.
@@ -293,9 +299,15 @@ void setup() {
         WiFi.begin(savedSsid.c_str(), savedPass.c_str());
     }
 
-    // Ethernet starten — kabel-detectie is async via onNetworkEvent
+    // Ethernet starten — kabel-detectie is async via onNetworkEvent.
+    // Expliciete LAN8720-config (esp32dev-board kent geen ETH_PHY_*-defaults).
     Serial.println("ETH start…");
-    ETH.begin();
+    ETH.begin(/*phy_addr*/ 1,
+              /*power*/    33,
+              /*mdc*/      23,
+              /*mdio*/     18,
+              /*type*/     ETH_PHY_LAN8720,
+              /*clk_mode*/ ETH_CLOCK_GPIO17_OUT);
 
     // 10s wachten tot ETH óf WiFi up is
     unsigned long deadline = millis() + 10000;
@@ -344,8 +356,11 @@ void setup() {
         ethConnected ? ETH.localIP().toString().c_str() : WiFi.localIP().toString().c_str());
     Serial.printf("  ↳ login: admin / %s\n", adminPass.c_str());
 
-    // P1-UART: 115200 8N1, RX-only (data komt naar ons toe)
+    // P1-UART: 115200 8N1, RX-only (data komt naar ons toe).
+    // Software-invert i.p.v. een NPN-inverter — moet ná begin() omdat
+    // begin() de UART opnieuw configureert en de invert-flag overschrijft.
     P1Serial.begin(115200, SERIAL_8N1, P1_RX_PIN, -1);
+    uart_set_line_inverse(UART_NUM_2, UART_SIGNAL_RXD_INV);
     reader.enable(true);
 
     Serial.println("Setup klaar. P1-data verwacht…");
@@ -354,6 +369,13 @@ void setup() {
 void loop() {
     management.loop();
     updater.loop();
+
+    // Diagnostiek: tel bytes vóór reader 'r consumeert
+    int avail = P1Serial.available();
+    if (avail > 0) {
+        p1BytesObserved += (uint32_t)avail;
+    }
+
     reader.loop();
 
     if (reader.available()) {

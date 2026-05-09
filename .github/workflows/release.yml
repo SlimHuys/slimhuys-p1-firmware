@@ -1,0 +1,79 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # nodig voor softprops/action-gh-release
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install PlatformIO
+        run: pip install platformio
+
+      - name: Cache PlatformIO toolchains
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio/.cache
+            ~/.platformio/packages
+            ~/.platformio/platforms
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+
+      - name: Build firmware
+        run: pio run
+
+      - name: Verify version matches tag
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          FW_VERSION=$(awk -F'\\"' '/FIRMWARE_VERSION/ {print $2}' platformio.ini)
+          if [[ "$TAG_VERSION" != "$FW_VERSION" ]]; then
+            echo "Tag $GITHUB_REF_NAME komt niet overeen met FIRMWARE_VERSION=$FW_VERSION in platformio.ini" >&2
+            exit 1
+          fi
+          echo "VERSION=$FW_VERSION" >> "$GITHUB_ENV"
+
+      - name: Stage artefacten
+        run: |
+          mkdir -p release
+          cp .pio/build/smarthomeshop-v3/firmware.bin        release/firmware.bin
+          cp .pio/build/smarthomeshop-v3/firmware-merged.bin release/firmware-merged.bin
+
+          BIN_URL="https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/firmware-merged.bin"
+
+          cat > release/manifest.json <<EOF
+          {
+            "name": "SlimHuys P1-bridge",
+            "version": "${VERSION}",
+            "new_install_prompt_erase": true,
+            "builds": [
+              {
+                "chipFamily": "ESP32",
+                "parts": [
+                  { "path": "${BIN_URL}", "offset": 0 }
+                ]
+              }
+            ]
+          }
+          EOF
+
+          ls -lh release/
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/firmware.bin
+            release/firmware-merged.bin
+            release/manifest.json
+          generate_release_notes: true
