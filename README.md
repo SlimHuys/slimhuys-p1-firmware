@@ -1,143 +1,144 @@
 # slimhuys-p1-firmware
 
-Open firmware voor een P1-bridge die DSMR-telegrammen van een Nederlandse
-slimme meter doorzet naar [SlimHuys.nl](https://slimhuys.nl). Doelhardware:
-**WT32-ETH01** (ESP32 + ethernet) of varianten op ESP32-C3/S3 met WiFi.
+Open-source firmware voor de **SlimHuys P1+water-bridge**. Pusht DSMR-telegrammen,
+water-pulses en lek-detectie naar [SlimHuys.nl](https://slimhuys.nl) en biedt
+een lokale management-UI op `http://<bridge-ip>/`.
 
-> **Status**: pre-release. Werkt op breadboard met testen pending eerste
-> echte hardware-fit.
+Eindklanten flashen via [slimhuys.nl/flash](https://slimhuys.nl/flash) — geen
+hardware-werk, geen toolchain, alleen Chrome/Edge op desktop met USB-C-kabel.
 
-## Bouwen — onderdelen
+## Hardware
 
-Voor één prototype:
+Doelhardware: **[WaterP1MeterKit V3](https://waterp1meterkit.nl)** van smarthomeshop
+(ESP32 + LAN8720 ethernet-PHY met PoE+, doorverkocht door SlimHuys met deze
+firmware vooraf gefllasht). De kit bevat:
 
-| Onderdeel | TinyTronics SKU | Prijs |
-|---|---|---|
-| WT32-ETH01 ESP32 ethernet board | 006083 | €13,50 |
-| RJ12 6P6C P1-poort kabel 50cm | 007296 | €3,25 |
-| NPN-transistor 2N3904 (10×) | 000116 | €1,50 |
-| 10kΩ weerstand (10×) | 000138 | €0,50 |
-| Breadboard 830 punten | 006327 | €5,00 |
-| DuPont jumpers Male-Male 100× | 002977 | €4,50 |
-| CH340E TTL USB-serieel | 004493 | €2,50 |
+- DSMR P1-poort (RJ12 → slimme meter)
+- Water-pulse-input (3-pin → reed-switch op de water-meter)
+- Lek-sensor-input (active-low, voor moisture-pad)
+- HDC1080 temp+vocht-sensor (I²C op de PCB)
+- RGB-status-LED zichtbaar door de behuizing
+- USB-C voeding + serial (CH343 → `/dev/cu.debug-console`)
+- PoE+ alternatief voor stroom
 
-**Totaal: ~€31** + verzending.
+### Pin-mapping
 
-## Schematic — level-converter + P1-input
-
-DSMR P1-poort levert een **5V geïnverteerd** UART-signaal. We converteren
-dat naar non-inverted 3.3V met een NPN-transistor + 2 weerstanden:
-
-```
-                                                            +3.3V
-                                                              │
-                                                              R2 (10kΩ)
-                                                              │
-   P1-RJ12 (slimme meter)                       ┌─── GPIO5 ──┴─── ESP32 RX2
-   ┌─────────────────┐                          │
-   │ pin 1: +5V ─────┼──┐                       │
-   │ pin 2: DTR  ────┼──┼─── GPIO33 (request)   │
-   │ pin 3: GND ─────┼──┼──────────┬────────────┤
-   │ pin 4: N/C      │  │          │            │
-   │ pin 5: RX-DATA ─┼──┼──┐       │   collector│
-   │ pin 6: GND      │  │  │       │           ╱│
-   └─────────────────┘  │  │       │      base╱ │  2N3904
-                        │  │       │      ───┤  │
-                        │  │       │          ╲ │
-                        │  │       │  emitter  ╲│
-                        │  │       │            └────────── GND
-                        │  │       │
-                        │  │     R1 (10kΩ)
-                        │  │       │
-                        │  │       └─── DATA-IN (base via R1)
-                        │  │
-                        ▼  ▼
-                   USB-C 5V naar ESP32 VIN (NIET via P1-pin1; te weinig
-                   stroom voor WT32-ETH01 onder ethernet-load)
-```
-
-**Pin-mapping**:
-
-| WT32-ETH01 pin | Functie |
+| GPIO | Functie |
 |---|---|
-| GPIO 5 | P1-RX (uit transistor-collector) |
-| GPIO 33 | P1-DTR (request-pin, naar slimme-meter pin 2) |
-| GND | gemeenschappelijke ground |
-| 5V (VIN) | externe USB-C-voeding |
+| 16 | P1-data RX (software-inverted UART, 115200 8N1) |
+| 12 | P1-request output (DTR) |
+| 32 | Water-pulse input (reed-switch, FALLING-edge ISR) |
+| 2  | Lek-sensor input (active-low, INPUT_PULLUP) |
+| 15 / 4 | I²C SDA/SCL voor HDC1080 |
+| 5 / 13 / 14 | RGB-LED rood/groen/blauw (LEDC PWM) |
+| 23 / 18 / 17 / 33 | LAN8720 PHY: MDC / MDIO / CLK_OUT / PWR |
 
-## Firmware bouwen + flashen
+## Features
+
+- **DSMR P1** — 1Hz push naar `/v1/me/readings` met voltage/current/power per fase, totalen, gas
+- **Water-meter** — cumulatieve liter-stand + live flow (L/min via 10s sliding window) naar `/v1/me/water-readings`
+- **Lek-detectie** — asymmetrische debounce (100ms aan / 2s uit), state-change push met exp.-backoff retry naar `/v1/me/bridges/leak`
+- **HDC1080** — temp + luchtvochtigheid met self-heating-compensatie (-4.5°C / +12%)
+- **Captive-portal pairing** — 6-cijferige code uit de SlimHuys-app; ethernet-aware (slaat WiFi-stap over als kabel up is)
+- **OTA-updates** — periodiek check naar `/v1/firmware/manifest`, sha256-geverifieerd
+- **Web-flasher** — [slimhuys.nl/flash](https://slimhuys.nl/flash) wijst naar `releases/latest/download/manifest.json` op deze repo (ESP Web Tools)
+- **Management-UI** — `http://<bridge-ip>/` met live verbruik, push-status, factory-reset, handmatige OTA-upload
+- **RGB-states** — groen=operationeel, blauw-pulse=pairing, rood=error, rood-blink=lekkage, cyan-flash=water-puls
+- **Production-hardening** — 30s task-watchdog, bootloop-detectie (3× crash binnen 60s → safe-mode met alleen management-UI)
+- **Diagnostics-push** — 1×/5min `{boot_count, uptime, heap, rssi, reset_reason, fw_version}` naar `/v1/me/bridges/diagnostics`
+- **Dual-core** — alle HTTP-pushes op core 0 via FreeRTOS-queue zodat WebServer + sensors op core 1 nooit blokkeren op TLS-handshakes
+
+## Eerste setup (eindklant)
+
+1. **Pairing-code** aanmaken in de SlimHuys-app onder *Mijn Huis → P1-bridge koppelen* (10 min geldig).
+2. **Bridge aansluiten**: PoE óf USB-C voor stroom, RJ12 in de P1-poort, optioneel water-pulse en/of lek-sensor.
+3. **Flashen** via [slimhuys.nl/flash](https://slimhuys.nl/flash) — USB-C op laptop, klik *Install*.
+4. **Captive-portal**: SSID `SlimHuys-Setup-XXXX`. Ethernet aangesloten → alleen pairing-code; anders WiFi-creds + code.
+5. Klaar — status-LED wordt groen, data verschijnt direct in de SlimHuys-app.
+
+Na een factory-reset is een nieuwe pairing-code nodig.
+
+## Bouwen uit source
 
 ```bash
-# Eenmalig: PlatformIO installeren
-pip install platformio
-# of via VSCode-extension "PlatformIO IDE"
-
-# Bouwen
-pio run
-
-# Flashen (eerste keer via USB-TTL adapter)
-pio run -t upload --upload-port /dev/cu.usbserial-XXXX
-
-# Serial-log lezen
-pio device monitor -b 115200
+pip install platformio                                # eenmalig
+pio run                                               # build
+scripts/release.sh                                    # genereert release/<v>/
+pio run -t upload --upload-port /dev/cu.debug-console # eerste flash
+pio device monitor -b 115200                          # serial-log
 ```
 
-**Eerste-keer flashen via CH340 TTL-adapter** (de WT32-ETH01 heeft geen
-USB onboard):
+Een tag `v*.*.*` op `main` triggert `.github/workflows/release.yml`, dat de
+volgende artefacten als GitHub Release publiceert:
 
-| CH340 pin | WT32-ETH01 pin |
+| Bestand | Doel |
 |---|---|
-| TX | RX0 |
-| RX | TX0 |
-| GND | GND |
-| 3V3 | 3V3 |
-| (handmatig) | EN naar GND voor reset |
-| (handmatig) | IO0 naar GND tijdens reset = flash-mode |
-
-Volgende updates kunnen via OTA over het netwerk — zie `platformio.ini`.
-
-## Eerste setup
-
-1. **Open SlimHuys** in je browser → Mijn Huis → "**+ Pairing-code aanmaken**".
-   Je krijgt een 6-cijferige code (10 min geldig).
-2. **Flash firmware** op je WT32-ETH01.
-3. **Steek USB-C voeding erin** (niet uit P1-poort — te weinig stroom voor ethernet).
-4. **Optioneel: ethernet-kabel** aansluiten. Werkt ook puur op WiFi.
-5. **Verbind met `SlimHuys-Setup`-WiFi** vanaf je telefoon (ESP32 hosting AP):
-   - Kies je eigen WiFi-netwerk + wachtwoord (zelfs als je ethernet hebt — dat is voor permanent).
-   - Vul de **6-cijferige pairing-code** in.
-   - Submit.
-6. Device wisselt code in voor api-key, bewaart in NVS, en de SlimHuys-app
-   springt automatisch naar "**Bridge gekoppeld ✓**".
-7. **Plug RJ12-kabel in je P1-poort**. Status-LED blijft aan = data flow OK.
-
-Vanaf nu boot device zelfstandig met opgeslagen credentials. Een nieuwe
-pairing-code is alleen nodig na een factory-reset.
+| `firmware.bin` | OTA-app-image, geflasht naar offset 0x10000 |
+| `firmware.bin.sha256` | sidecar voor integriteitscheck |
+| `firmware-merged.bin` | full flash-image (offset 0x0) voor web-flasher |
+| `manifest.json` | ESP Web Tools manifest met absolute GitHub-URL |
 
 ## Architectuur
 
 ```
-┌──────────────┐     ┌─────────────────┐    ┌──────────────────┐
-│ slimme meter │ P1  │ WT32-ETH01      │    │ slimhuys.nl      │
-│              ├────▶│  + DSMR-parser  ├───▶│ /v1/me/readings  │
-│  (DSMR v5)   │ 1Hz │  + HTTPS POST   │ 1Hz│  + Reverb-WS     │
-└──────────────┘     └─────────────────┘    └──────────────────┘
-                            ▲                          │
-                            │ /v1/bridges/claim        ▼
-                            │ (eerste setup)   ┌──────────────────┐
-                            │                  │ SlimHuys-dashboard│
-                            │                  │  realtime ~1Hz   │
-                       6-cijferige             └──────────────────┘
-                       pairing-code
-                       uit SlimHuys-app
+┌─ CORE 1 (loopTask) ─────────────────┐     ┌─ CORE 0 (push-worker) ─┐
+│  WebServer.handleClient()           │     │                        │
+│  Sensors: P1 UART, leak, HDC, flow  │     │  xQueueReceive  ─────  │
+│  reader.parse() → JSON build (5ms)  │ ──▶ │  HTTPClient.POST/PUT   │
+│  enqueuePush() (microseconden)      │     │    └─ TLS-handshake    │
+│  LED-state + cyan-flash             │     │  callback(http_code)   │
+│  WDT reset                          │     │  WDT reset             │
+└─────────────────────────────────────┘     └────────────────────────┘
+       │                                              │
+       │                                              ▼
+       │                                       Persistente
+       ▼                                       WiFiClientSecure
+   Captive-portal,                             (TLS-session-cache)
+   management-UI,
+   sensor-fusion
 ```
 
-Velden die we doorzetten matchen 1-op-1 met de
-[HACS-integratie](https://github.com/SlimHuys/slimhuys-homeassistant) v0.4.0:
-voltage L1/L2/L3, current L1/L2/L3, active_power_l1/l2/l3 (consumed),
-active_power_returned_l1/l2/l3 (returned), gas_total_m3, plus de basics
-(consumption_kwh_total, delivered_kwh_total, active_power_w).
+Pushes worden in de main-loop *gebouwd* (~5ms JSON-serialize) en naar een
+FreeRTOS-queue gestuurd. De worker-task op core 0 doet de HTTP-roundtrip
+zonder ooit core 1 te blokkeren — WebServer-responses blijven vlot, sensor-
+poll-cadens stabiel 1Hz.
+
+## API-contracts
+
+| Endpoint | Method | Wanneer |
+|---|---|---|
+| `/v1/me/readings` | POST | 1Hz P1-telegrammen |
+| `/v1/me/water-readings` | POST | Bij verandering (max 1Hz), 60s heartbeat |
+| `/v1/me/bridges/leak` | POST | Op state-change, retry-policy in callback |
+| `/v1/me/bridges/management` | PUT | Bij pairing + IP-wijziging (idempotent) |
+| `/v1/me/bridges/diagnostics` | POST | 1×/5min field-health |
+| `/v1/firmware/manifest` | GET | Periodiek voor OTA-check |
+| `/v1/bridges/claim` | POST | Eenmalig: code → api_key |
+
+Alle pushes gebruiken Bearer-auth met de `api_key` uit NVS (geset bij eerste pairing).
+
+## Repository-structuur
+
+```
+.
+├── platformio.ini                    PIO-config (board=esp32dev, min_spiffs partities)
+├── include/
+│   ├── management.h                  WebServer-interface (UI + status-API)
+│   ├── portal.h                      Captive-portal-class
+│   └── updater.h                     OTA-updater
+├── src/
+│   ├── main.cpp                      Entry, loop, sensor-fusion, push-helpers
+│   ├── management.cpp                /api/status JSON + embedded HTML/CSS/JS
+│   ├── portal.cpp                    AP + DNS-hijack + setup-pagina
+│   └── updater.cpp                   /v1/firmware/manifest poll + flash
+├── scripts/
+│   ├── merge_firmware.py             post-build: bouwt firmware-merged.bin
+│   └── release.sh                    lokale release-bouw
+└── .github/workflows/
+    └── release.yml                   tag → GitHub Release met alle artefacten
+```
 
 ## Licentie
 
-MIT. Hardware-design (PCB later) onder CERN-OHL-S.
+MIT. Hardware komt van [smarthomeshop](https://smarthomeshop.io) (ook MIT-firmware,
+maar die wordt overschreven door deze build).
