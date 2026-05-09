@@ -50,6 +50,9 @@ public:
     void recordLeakPush(int httpStatus);
     void recordParse(bool ok, const String& error = String());
     void setSafeMode(bool enabled) { _safeMode = enabled; }
+    // Voor diagnostics-push: meest recente P1-push HTTP-status,
+    // gebruikt om "ok"/"fail" af te leiden in de payload.
+    int lastPushStatus() const { return _lastPushStatus; }
     void setLastReading(const LastReading& r) { _lastReading = r; }
     void setLeakDetected(bool detected) { _leakDetected = detected; }
     void setWaterFlow(float lpm) { _waterFlowLpm = lpm; }

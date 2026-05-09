@@ -78,6 +78,11 @@ constexpr int FLOW_WINDOW_S = 10;
 constexpr uint32_t WDT_TIMEOUT_S = 30;          // ruim boven HTTPClient TLS-handshake
 constexpr uint32_t BOOTLOOP_THRESHOLD = 3;       // 3 crashes-in-een-rij → safe-mode
 constexpr unsigned long BOOTLOOP_GRACE_MS = 60000; // na 60s uptime = "succesvol gebooten"
+
+// Diagnostics-push: 1×/5min — vangt config-bugs en field-health zonder
+// klantcontact. Backend throttle is 12/u, dus 5min is comfortabel binnen.
+constexpr unsigned long DIAG_PUSH_INTERVAL_MS = 5UL * 60UL * 1000UL;
+constexpr unsigned long DIAG_FIRST_PUSH_DELAY_MS = 30000; // 30s grace na boot
 constexpr int PUSH_INTERVAL_MS = 1000;             // P1: 1Hz
 constexpr int WATER_PUSH_THROTTLE_MS = 1000;       // Water: max 1Hz bij verandering
 constexpr int WATER_PUSH_HEARTBEAT_MS = 60000;     // Water: periodiek ook bij stilstand
@@ -158,6 +163,12 @@ unsigned long waterPulseFlashUntil = 0;
 // → safe-mode (alleen management-UI, geen pushes/portal).
 bool safeMode = false;
 bool bootloopGraceCleared = false;
+
+// Diagnostics-push state
+unsigned long lastDiagPushAt = 0;
+bool diagFirstPushDone = false;
+uint32_t bootCount = 0;        // monotonic, niet gereset zoals crash_count
+esp_reset_reason_t bootResetReason = ESP_RST_UNKNOWN;
 
 // Persistente TLS-client voor HTTPClient. Eén instance hergebruiken
 // betekent dat lwIP/mbedtls de TLS-sessie ID kan cachen — bij volgende
@@ -531,6 +542,64 @@ void pushManagementInfo() {
 }
 
 // ============================================================================
+// Push naar SlimHuys-API — diagnostics (1×/5min field-health snapshot)
+// ============================================================================
+static const char* resetReasonString(esp_reset_reason_t r) {
+    switch (r) {
+        case ESP_RST_POWERON:   return "POWERON";
+        case ESP_RST_EXT:       return "EXT";
+        case ESP_RST_SW:        return "SW";
+        case ESP_RST_PANIC:     return "PANIC";
+        case ESP_RST_INT_WDT:   return "INT_WDT";
+        case ESP_RST_TASK_WDT:  return "TASK_WDT";
+        case ESP_RST_WDT:       return "WDT";
+        case ESP_RST_BROWNOUT:  return "BROWNOUT";
+        case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+        default:                return "UNKNOWN";
+    }
+}
+
+void pushDiagnostics() {
+    if (!networkReady() || apiKey.isEmpty() || baseUrl.isEmpty()) return;
+
+    // Last-push-status afleiden van P1's meest recente HTTP-code. Backoff-
+    // state tracken we alleen voor leak; voor de andere pushes is "fail" een
+    // goede approximatie als de laatste roundtrip niet 200/202 was.
+    int lastP1 = management.lastPushStatus();
+    const char* statusStr = (lastP1 == 200 || lastP1 == 202) ? "ok"
+                          : (lastP1 == 0)                    ? "ok"  // nog nooit gepusht
+                          : "fail";
+
+    JsonDocument doc;
+    doc["boot_count"] = bootCount;
+    doc["uptime_sec"] = millis() / 1000UL;
+    doc["last_push_status"] = statusStr;
+    doc["free_heap_bytes"] = ESP.getFreeHeap();
+    if (WiFi.status() == WL_CONNECTED) {
+        doc["wifi_rssi_dbm"] = WiFi.RSSI();
+    }
+    doc["fw_version"] = FIRMWARE_VERSION;
+    doc["reset_reason"] = resetReasonString(bootResetReason);
+
+    String payload;
+    serializeJson(doc, payload);
+
+    HTTPClient http;
+    http.setReuse(true);
+    http.begin(secureClient, baseUrl + "/v1/me/bridges/diagnostics");
+    http.addHeader("Authorization", "Bearer " + apiKey);
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("User-Agent", "slimhuys-p1/" FIRMWARE_VERSION);
+
+    int code = http.POST(payload);
+    http.end();
+    Serial.printf("Diag-POST: HTTP %d (heap=%u, rssi=%d, status=%s)\n",
+                  code, (unsigned)ESP.getFreeHeap(),
+                  WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0,
+                  statusStr);
+}
+
+// ============================================================================
 // Push naar SlimHuys-API — lek-event (state-change only)
 // ----------------------------------------------------------------------------
 // Returnt HTTP-code, of -1 bij netwerk-/precondition-fail. Caller beslist
@@ -608,7 +677,9 @@ void pushWaterReading(uint32_t total_l) {
 void setup() {
     Serial.begin(115200);
     Serial.println("\n=== SlimHuys P1-bridge v" FIRMWARE_VERSION " ===");
-    Serial.printf("Reset reason: %d\n", (int)esp_reset_reason());
+    bootResetReason = esp_reset_reason();
+    Serial.printf("Reset reason: %d (%s)\n",
+                  (int)bootResetReason, resetReasonString(bootResetReason));
 
     // RGB-indicator zo vroeg mogelijk: gebruiker ziet meteen of de bridge
     // boot. Groen = boot/operational, blauw-pulse = pairing, rood = error,
@@ -622,8 +693,13 @@ void setup() {
     bootPrefs.begin("slimhuys", false);
     uint32_t crashCount = bootPrefs.getUInt("crash_count", 0) + 1;
     bootPrefs.putUInt("crash_count", crashCount);
+    // boot_count is monotonic — telt elke boot (i.t.t. crash_count die op
+    // 60s stabiele uptime gereset wordt). Naar diagnostics-push.
+    bootCount = bootPrefs.getUInt("boot_count", 0) + 1;
+    bootPrefs.putUInt("boot_count", bootCount);
     bootPrefs.end();
-    Serial.printf("Boot-counter (sinds laatste 60s+ uptime): %u\n", (unsigned)crashCount);
+    Serial.printf("Boot #%u (crashes-in-een-rij: %u)\n",
+                  (unsigned)bootCount, (unsigned)crashCount);
     if (crashCount >= BOOTLOOP_THRESHOLD) {
         safeMode = true;
         Serial.println("⚠️  SAFE-MODE — herhaalde crashes gedetecteerd");
@@ -890,6 +966,17 @@ void loop() {
         flowSampleIdx = (flowSampleIdx + 1) % FLOW_WINDOW_S;
         lastFlowSampleAt = now;
         management.setWaterFlow(currentFlowLpm);
+    }
+
+    // Diagnostics-push: 30s na boot (eerste keer met reset_reason van
+    // de afgelopen reset), daarna elke 5min. Backend throttle is 12/u.
+    if (!diagFirstPushDone && now >= DIAG_FIRST_PUSH_DELAY_MS) {
+        pushDiagnostics();
+        lastDiagPushAt = now;
+        diagFirstPushDone = true;
+    } else if (diagFirstPushDone && now - lastDiagPushAt >= DIAG_PUSH_INTERVAL_MS) {
+        pushDiagnostics();
+        lastDiagPushAt = now;
     }
 
     // LED-mode hertonen op basis van runtime-state. PAIRING wordt apart
