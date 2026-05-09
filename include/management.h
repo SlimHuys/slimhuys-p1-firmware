@@ -49,6 +49,7 @@ public:
     void recordWaterPush(int httpStatus);
     void recordParse(bool ok, const String& error = String());
     void setLastReading(const LastReading& r) { _lastReading = r; }
+    void setLeakDetected(bool detected) { _leakDetected = detected; }
 
 private:
     void _setupRoutes();
@@ -89,4 +90,7 @@ private:
     uint32_t _consecutiveParseFails = 0;
 
     LastReading _lastReading;
+    // Onafhankelijk van P1-state: leak-sensor moet ook werken zonder
+    // DSMR-telegrammen, dus losse veld i.p.v. in LastReading.
+    bool _leakDetected = false;
 };

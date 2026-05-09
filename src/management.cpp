@@ -121,6 +121,8 @@ void ManagementInterface::_handleStatus() {
     water["push_ok_count"] = _waterPushOk;
     water["push_fail_count"] = _waterPushFail;
 
+    doc["water_leak"] = _leakDetected;
+
     if (_updater) {
         JsonObject ota = doc["ota"].to<JsonObject>();
         ota["channel"] = _updater->channel();
@@ -459,6 +461,10 @@ const char MANAGEMENT_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
       <div class="row-label">Water totaal</div>
       <div class="row-value" id="water">—</div>
     </div>
+    <div class="row">
+      <div class="row-label">Lekkage</div>
+      <div class="row-value" id="leak">…</div>
+    </div>
   </div>
 
   <h2>Status</h2>
@@ -593,6 +599,13 @@ function refresh() {
     }
     renderPush(document.getElementById('api'),       d.api,   'Nog niet gepusht');
     renderPush(document.getElementById('water-api'), d.water, 'Nog niet gepusht');
+
+    var leakEl = document.getElementById('leak');
+    if (d.water_leak) {
+      leakEl.innerHTML = dot('err') + '<strong>Gedetecteerd</strong>';
+    } else {
+      leakEl.innerHTML = dot('ok') + 'Geen lekkage';
+    }
 
     document.getElementById('uptime').textContent = fmtUptime(d.uptime_s);
     document.getElementById('version').textContent = 'v' + d.version;

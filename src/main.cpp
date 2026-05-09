@@ -10,6 +10,7 @@
  *   GPIO 12 → P1-request (data-trigger naar slimme meter)
  *   GPIO 13 → groene LED van de RGB-indicator (ETH-status)
  *   GPIO 32 ← water-pulse (reed-switch, 1 puls = 1L default)
+ *   GPIO 2  ← waterlek-sensor (active-low, INPUT_PULLUP)
  *   LAN8720 PHY → ethernet RJ45 (MDC=23, MDIO=18, CLK=17_OUT, PWR=33, addr=1)
  *
  * Provisioning: bij eerste boot start een captive-portal op SSID
@@ -42,6 +43,8 @@ constexpr int P1_RX_PIN = 16;       // DSMR-data (software-inverted UART)
 constexpr int P1_REQUEST_PIN = 12;  // Data-trigger naar slimme meter (DTR)
 constexpr int LED_PIN = 13;         // Groene kanaal van de RGB-indicator
 constexpr int WATER_PULSE_PIN = 32; // Reed-switch op water-meter
+constexpr int WATER_LEAK_PIN = 2;   // Lekkage-sensor (LOW=leak, INPUT_PULLUP)
+constexpr unsigned long LEAK_DEBOUNCE_MS = 100; // stabiele-tijd voor commit
 constexpr int PUSH_INTERVAL_MS = 1000;             // P1: 1Hz
 constexpr int WATER_PUSH_THROTTLE_MS = 1000;       // Water: max 1Hz bij verandering
 constexpr int WATER_PUSH_HEARTBEAT_MS = 60000;     // Water: periodiek ook bij stilstand
@@ -83,6 +86,12 @@ uint32_t p1BytesObserved = 0;
 // xtensa, dus geen explicit lock nodig.
 volatile uint32_t waterPulseCount = 0;
 volatile unsigned long lastPulseUs = 0;
+
+// Lek-sensor debounce: track laatste raw-read en wanneer 't omsloeg.
+// Pas committen naar management als 't ≥LEAK_DEBOUNCE_MS stabiel is.
+bool leakRawState = false;
+bool leakStableState = false;
+unsigned long leakChangedAt = 0;
 
 void IRAM_ATTR onWaterPulse() {
     unsigned long now = micros();
@@ -397,6 +406,10 @@ void setup() {
     pinMode(WATER_PULSE_PIN, INPUT_PULLUP);
     attachInterrupt(digitalPinToInterrupt(WATER_PULSE_PIN), onWaterPulse, FALLING);
 
+    // Lek-sensor: active-low (sensor pulled-up via interne resistor, lek = LOW).
+    // GPIO2 is een strapping pin maar runtime-gebruik als input is veilig.
+    pinMode(WATER_LEAK_PIN, INPUT_PULLUP);
+
     // Hostname opbouwen vóór WiFi/ETH starten — anders kondigt 't bord
     // zich aan als "esp32-XXXXXX" / "espressif" in de DHCP-tabel.
     deviceHostname = makeHostname();
@@ -527,6 +540,19 @@ void loop() {
         prefs.putUInt("water_l", total_l);
         lastPersistedTotal = total_l;
         lastWaterPersistAt = now;
+    }
+
+    // Lek-sensor: poll + 100ms debounce. Pas commit als raw-state stabiel is,
+    // zodat een vluchtige glitch geen alert geeft.
+    bool leakRaw = (digitalRead(WATER_LEAK_PIN) == LOW);
+    if (leakRaw != leakRawState) {
+        leakRawState = leakRaw;
+        leakChangedAt = now;
+    }
+    if (leakRawState != leakStableState && now - leakChangedAt >= LEAK_DEBOUNCE_MS) {
+        leakStableState = leakRawState;
+        Serial.printf("Lekkage-sensor: %s\n", leakStableState ? "GEDETECTEERD" : "geen");
+        management.setLeakDetected(leakStableState);
     }
 
     // Diagnostiek: tel bytes vóór reader 'r consumeert
