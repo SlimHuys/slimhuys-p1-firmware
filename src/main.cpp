@@ -36,6 +36,10 @@
 #include <driver/uart.h>
 #include <esp_task_wdt.h>
 #include <esp_system.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/queue.h>
+#include <functional>
 #include <time.h>
 
 #include "management.h"
@@ -110,8 +114,9 @@ unsigned long lastPushAt = 0;
 unsigned long lastWaterPushAt = 0;
 unsigned long lastWaterPersistAt = 0;
 // Sentinel UINT32_MAX zodat de eerste vergelijking altijd "changed" zegt
-// en de eerste push dus direct vuurt op boot.
-uint32_t lastPushedTotal = 0xFFFFFFFFu;
+// en de eerste push dus direct vuurt op boot. volatile omdat de worker-
+// task 'm schrijft in de push-callback en main-loop 'm leest.
+volatile uint32_t lastPushedTotal = 0xFFFFFFFFu;
 uint32_t lastPersistedTotal = 0;
 
 // Diagnostiek: hoeveel bytes hebben we überhaupt op de UART zien
@@ -134,9 +139,10 @@ unsigned long leakChangedAt = 0;
 // Lek-push state: pas POST'en als state-change verschilt van wat we de
 // backend laatst hebben verteld. NVS-persist zodat een reboot middenin
 // een leak niet opnieuw "detected"-spam veroorzaakt.
-bool lastPushedLeakState = false;
-unsigned long leakNextRetryAt = 0;
-int leakRetryAttempts = 0;
+// volatile: schrijven gebeurt in worker-callback (core 0), main-loop leest.
+volatile bool lastPushedLeakState = false;
+volatile unsigned long leakNextRetryAt = 0;
+volatile int leakRetryAttempts = 0;
 // Exp. backoff schema voor 5xx/network: 15s, 60s, 5min, 30min cap.
 constexpr unsigned long LEAK_BACKOFF_MS[] = {15000UL, 60000UL, 300000UL, 1800000UL};
 constexpr unsigned long LEAK_4XX_COOLDOWN_MS = 1800000UL; // 30min na bridge-bug
@@ -173,7 +179,28 @@ esp_reset_reason_t bootResetReason = ESP_RST_UNKNOWN;
 // Persistente TLS-client voor HTTPClient. Eén instance hergebruiken
 // betekent dat lwIP/mbedtls de TLS-sessie ID kan cachen — bij volgende
 // requests slaat 't de zware public-key handshake over (~300ms → ~50ms).
+// Wordt EXCLUSIEF door pushWorkerTask gebruikt (core 0), dus geen
+// thread-safety zorgen.
 WiFiClientSecure secureClient;
+
+// HTTP-pushes draaien op een aparte FreeRTOS-task gepind aan core 0.
+// De main-loop (core 1) blocked dus niet meer 50-400ms per TLS-roundtrip
+// → WebServer reageert vlot, sensor-poll-cadens blijft 1Hz, geen
+// gestaggerde pollintervals.
+struct PushJob {
+    String url;
+    String method;       // "POST" of "PUT"
+    String payload;
+    std::function<void(int)> onComplete;
+};
+
+QueueHandle_t pushQueue = nullptr;
+TaskHandle_t pushTaskHandle = nullptr;
+
+// In-flight gate voor leak-push: voorkomt dat een tweede leak-event
+// in de queue komt voordat de eerste callback de retry-state heeft
+// bijgewerkt (race tussen state-change en callback).
+volatile bool leakPushInFlight = false;
 
 // LED-state-machine. LEDC PWM doet de blinks autonoom in hardware,
 // dus de loop hoeft niks te toggle'en. Mode-transitions schrijven alleen
@@ -197,8 +224,11 @@ void IRAM_ATTR onWaterPulse() {
 }
 
 // Forward-decl — pickLedMode() heeft 'm nodig vóórdat networkReady() definitief
-// gedefinieerd is verderop.
+// gedefinieerd is verderop. Idem voor enqueuePush dat door push-functies
+// hogerop in de file gebruikt wordt.
 bool networkReady();
+bool enqueuePush(const String& url, const String& method, const String& payload,
+                 std::function<void(int)> onComplete);
 
 // ============================================================================
 // LED-state machine
@@ -476,25 +506,17 @@ void pushReading(P1Data& d) {
     String payload;
     serializeJson(doc, payload);
 
-    HTTPClient http;
-    http.setReuse(true);
-    http.begin(secureClient, baseUrl + "/v1/me/readings");
-    http.addHeader("Authorization", "Bearer " + apiKey);
-    http.addHeader("Content-Type", "application/json");
-    http.addHeader("User-Agent", "slimhuys-p1/" FIRMWARE_VERSION);
-
-    int code = http.POST(payload);
-    if (code != 202) {
-        Serial.printf("POST faalde: HTTP %d\n", code);
-    }
-    http.end();
-    management.recordPush(code);
-
-    // Eerste succesvolle push = signaal dat deze firmware werkt; voorkom
-    // bootloader-rollback naar de vorige versie. No-op als geen pending OTA.
-    if (code == 202 || code == 200) {
-        updater.markValid();
-    }
+    enqueuePush(baseUrl + "/v1/me/readings", "POST", payload, [](int code) {
+        if (code != 202) {
+            Serial.printf("POST faalde: HTTP %d\n", code);
+        }
+        management.recordPush(code);
+        // Eerste succesvolle push = signaal dat deze firmware werkt; voorkom
+        // bootloader-rollback naar de vorige versie. No-op als geen pending OTA.
+        if (code == 202 || code == 200) {
+            updater.markValid();
+        }
+    });
 }
 
 // ============================================================================
@@ -524,21 +546,68 @@ void pushManagementInfo() {
     String payload;
     serializeJson(doc, payload);
 
-    HTTPClient http;
-    http.setReuse(true);
-    http.begin(secureClient, baseUrl + "/v1/me/bridges/management");
-    http.addHeader("Authorization", "Bearer " + apiKey);
-    http.addHeader("Content-Type", "application/json");
-    http.addHeader("User-Agent", "slimhuys-p1/" FIRMWARE_VERSION);
+    enqueuePush(baseUrl + "/v1/me/bridges/management", "PUT", payload,
+        [currentIp](int code) {
+            Serial.printf("Management-info PUT: HTTP %d (host=%s)\n",
+                          code, currentIp.c_str());
+            if (code == 204 || code == 200) {
+                prefs.putString("mgmt_ip", currentIp);
+            }
+        });
+}
 
-    int code = http.PUT(payload);
-    http.end();
+// ============================================================================
+// Push-worker — alle HTTP-pushes draaien op core 0 (deze task), main-loop
+// op core 1 enqueue't alleen. Zo blokkeert geen TLS-roundtrip ooit nog de
+// WebServer of sensor-poll.
+// ============================================================================
+void pushWorkerTask(void* /*param*/) {
+    esp_task_wdt_add(NULL);
+    Serial.println("Push-worker gestart op core 0");
+    for (;;) {
+        esp_task_wdt_reset();
+        PushJob* job = nullptr;
+        if (xQueueReceive(pushQueue, &job, pdMS_TO_TICKS(5000)) != pdTRUE) {
+            continue;  // periodieke wakeup voor WDT-reset
+        }
+        if (!job) continue;
 
-    Serial.printf("Management-info PUT: HTTP %d (host=%s)\n", code, currentIp.c_str());
+        HTTPClient http;
+        http.setReuse(true);
+        http.begin(secureClient, job->url);
+        http.addHeader("Authorization", "Bearer " + apiKey);
+        http.addHeader("Content-Type", "application/json");
+        http.addHeader("User-Agent", "slimhuys-p1/" FIRMWARE_VERSION);
 
-    if (code == 204 || code == 200) {
-        prefs.putString("mgmt_ip", currentIp);
+        int code = (job->method == "PUT")
+                   ? http.PUT(job->payload)
+                   : http.POST(job->payload);
+        http.end();
+
+        if (job->onComplete) job->onComplete(code);
+        delete job;
     }
+}
+
+bool enqueuePush(const String& url, const String& method, const String& payload,
+                 std::function<void(int)> onComplete) {
+    if (!pushQueue) return false;
+    if (!networkReady() || apiKey.isEmpty()) return false;
+
+    PushJob* job = new PushJob{url, method, payload, std::move(onComplete)};
+    if (xQueueSend(pushQueue, &job, 0) != pdTRUE) {
+        Serial.println("Push-queue vol — request gedropt");
+        delete job;
+        return false;
+    }
+    return true;
+}
+
+void initPushWorker() {
+    pushQueue = xQueueCreate(10, sizeof(PushJob*));
+    xTaskCreatePinnedToCore(
+        pushWorkerTask, "push-worker", 8192, nullptr,
+        1 /* priority */, &pushTaskHandle, 0 /* core 0 */);
 }
 
 // ============================================================================
@@ -584,19 +653,10 @@ void pushDiagnostics() {
     String payload;
     serializeJson(doc, payload);
 
-    HTTPClient http;
-    http.setReuse(true);
-    http.begin(secureClient, baseUrl + "/v1/me/bridges/diagnostics");
-    http.addHeader("Authorization", "Bearer " + apiKey);
-    http.addHeader("Content-Type", "application/json");
-    http.addHeader("User-Agent", "slimhuys-p1/" FIRMWARE_VERSION);
-
-    int code = http.POST(payload);
-    http.end();
-    Serial.printf("Diag-POST: HTTP %d (heap=%u, rssi=%d, status=%s)\n",
-                  code, (unsigned)ESP.getFreeHeap(),
-                  WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0,
-                  statusStr);
+    enqueuePush(baseUrl + "/v1/me/bridges/diagnostics", "POST", payload,
+        [](int code) {
+            Serial.printf("Diag-POST: HTTP %d\n", code);
+        });
 }
 
 // ============================================================================
@@ -607,9 +667,10 @@ void pushDiagnostics() {
 // detected_at uit iso8601Now(); NTP-sync wachten zodat de alert-mail geen
 // "1970"-timestamp krijgt.
 // ============================================================================
-int pushLeakState(bool detected) {
-    if (!networkReady() || apiKey.isEmpty() || baseUrl.isEmpty()) return -1;
-    if (time(nullptr) < 1700000000) return -1;  // NTP nog niet gesynced
+void pushLeakState(bool detected) {
+    if (leakPushInFlight) return;
+    if (!networkReady() || apiKey.isEmpty() || baseUrl.isEmpty()) return;
+    if (time(nullptr) < 1700000000) return;  // NTP nog niet gesynced
 
     JsonDocument doc;
     doc["detected"] = detected;
@@ -619,18 +680,30 @@ int pushLeakState(bool detected) {
     String payload;
     serializeJson(doc, payload);
 
-    HTTPClient http;
-    http.setReuse(true);
-    http.begin(secureClient, baseUrl + "/v1/me/bridges/leak");
-    http.addHeader("Authorization", "Bearer " + apiKey);
-    http.addHeader("Content-Type", "application/json");
-    http.addHeader("User-Agent", "slimhuys-p1/" FIRMWARE_VERSION);
-
-    int code = http.POST(payload);
-    http.end();
-    Serial.printf("Leak-POST (%s): HTTP %d\n", detected ? "WET" : "DRY", code);
-    management.recordLeakPush(code);
-    return code;
+    leakPushInFlight = true;
+    bool ok = enqueuePush(baseUrl + "/v1/me/bridges/leak", "POST", payload,
+        [detected](int code) {
+            Serial.printf("Leak-POST (%s): HTTP %d\n", detected ? "WET" : "DRY", code);
+            management.recordLeakPush(code);
+            unsigned long now = millis();
+            if (code == 204 || code == 200) {
+                lastPushedLeakState = detected;
+                prefs.putBool("leak_state", lastPushedLeakState);
+                leakRetryAttempts = 0;
+                leakNextRetryAt = 0;
+            } else if (code >= 400 && code < 500) {
+                Serial.printf("Leak-POST 4xx (%d) — geen retry, 30min cooldown\n", code);
+                leakNextRetryAt = now + LEAK_4XX_COOLDOWN_MS;
+            } else {
+                int idx = leakRetryAttempts < 4 ? leakRetryAttempts : 3;
+                leakNextRetryAt = now + LEAK_BACKOFF_MS[idx];
+                leakRetryAttempts++;
+                Serial.printf("Leak-POST retry-%d in %lums\n",
+                              leakRetryAttempts, LEAK_BACKOFF_MS[idx]);
+            }
+            leakPushInFlight = false;
+        });
+    if (!ok) leakPushInFlight = false;  // enqueue faalde, gate weer vrij
 }
 
 // ============================================================================
@@ -652,23 +725,16 @@ void pushWaterReading(uint32_t total_l) {
     String payload;
     serializeJson(doc, payload);
 
-    HTTPClient http;
-    http.setReuse(true);
-    http.begin(secureClient, baseUrl + "/v1/me/water-readings");
-    http.addHeader("Authorization", "Bearer " + apiKey);
-    http.addHeader("Content-Type", "application/json");
-    http.addHeader("User-Agent", "slimhuys-p1/" FIRMWARE_VERSION);
-
-    int code = http.POST(payload);
-    if (code != 202 && code != 200) {
-        Serial.printf("Water-POST faalde: HTTP %d\n", code);
-    }
-    http.end();
-    management.recordWaterPush(code);
-
-    if (code == 202 || code == 200) {
-        lastPushedTotal = total_l;
-    }
+    enqueuePush(baseUrl + "/v1/me/water-readings", "POST", payload,
+        [total_l](int code) {
+            if (code != 202 && code != 200) {
+                Serial.printf("Water-POST faalde: HTTP %d\n", code);
+            }
+            management.recordWaterPush(code);
+            if (code == 202 || code == 200) {
+                lastPushedTotal = total_l;
+            }
+        });
 }
 
 // ============================================================================
@@ -709,6 +775,10 @@ void setup() {
     // Persistente HTTPS-client zonder cert-pinning (slimhuys.nl is publieke
     // CA, een MITM op het lokale net is niet ons dreigingsmodel).
     secureClient.setInsecure();
+
+    // Push-worker draait op core 0 — main-loop (core 1) blokkeert nu niet
+    // meer 50-400ms per push. Initialiseren vóór de eerste enqueuePush.
+    initPushWorker();
 
     // Config laden uit NVS
     prefs.begin("slimhuys", false);
@@ -923,28 +993,10 @@ void loop() {
         }
     }
 
-    // Lek-push: alleen op state-change pushen. Retry-policy:
-    //  - 204/200: persist nieuwe state, klaar
-    //  - 5xx/netwerk: exp. backoff (15s, 60s, 5min, 30min cap)
-    //  - 4xx (validation/auth): cooldown 30min, geen verdere retry tot
-    //    state weer omslaat (bridge-bug, hammeren helpt niet)
-    if (leakStableState != lastPushedLeakState && now >= leakNextRetryAt) {
-        int code = pushLeakState(leakStableState);
-        if (code == 204 || code == 200) {
-            lastPushedLeakState = leakStableState;
-            prefs.putBool("leak_state", lastPushedLeakState);
-            leakRetryAttempts = 0;
-            leakNextRetryAt = 0;
-        } else if (code >= 400 && code < 500) {
-            Serial.printf("Leak-POST 4xx (%d) — geen retry, 30min cooldown\n", code);
-            leakNextRetryAt = now + LEAK_4XX_COOLDOWN_MS;
-        } else {
-            int idx = leakRetryAttempts < 4 ? leakRetryAttempts : 3;
-            leakNextRetryAt = now + LEAK_BACKOFF_MS[idx];
-            leakRetryAttempts++;
-            Serial.printf("Leak-POST retry-%d in %lums\n",
-                          leakRetryAttempts, LEAK_BACKOFF_MS[idx]);
-        }
+    // Lek-push: alleen op state-change pushen. Async via worker-task —
+    // retry-policy + NVS-write zit in de callback (zie pushLeakState).
+    if (leakStableState != lastPushedLeakState && now >= leakNextRetryAt && !leakPushInFlight) {
+        pushLeakState(leakStableState);
     }
 
     // HDC1080: 1×/30s temp+vocht binnenhalen en aan management doorgeven.
