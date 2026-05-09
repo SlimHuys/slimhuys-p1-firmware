@@ -720,7 +720,7 @@ function doOta() {
 }
 
 refresh();
-setInterval(refresh, 2000);
+setInterval(refresh, 1000);
 </script>
 </body>
 </html>
