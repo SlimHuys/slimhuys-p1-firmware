@@ -320,7 +320,9 @@ void setup() {
         Serial.println("Captive portal start (geen netwerk of geen api-key)");
         CaptivePortal portal;
         String claimUrl = String(SLIMHUYS_BASE_URL) + "/v1/bridges/claim";
-        if (!portal.run("SlimHuys-Setup", claimUrl)) {
+        // Ethernet-state doorgeven zodat het portaal alleen om de pairing-code
+        // hoeft te vragen als de kabel al up is.
+        if (!portal.run("SlimHuys-Setup", claimUrl, ethConnected)) {
             Serial.println("Portal timeout/error — reboot in 5s");
             delay(5000);
             ESP.restart();
@@ -330,8 +332,12 @@ void setup() {
         baseUrl = portal.baseUrl();
         prefs.putString("api_key", apiKey);
         prefs.putString("base_url", baseUrl);
-        prefs.putString("wifi_ssid", portal.ssid());
-        prefs.putString("wifi_pass", portal.password());
+        // WiFi-creds alleen bewaren als de gebruiker ze heeft ingevuld —
+        // anders zou de ethernet-flow de eventuele bestaande creds wissen.
+        if (!portal.ssid().isEmpty()) {
+            prefs.putString("wifi_ssid", portal.ssid());
+            prefs.putString("wifi_pass", portal.password());
+        }
         Serial.println("Credentials bewaard in NVS");
     }
 

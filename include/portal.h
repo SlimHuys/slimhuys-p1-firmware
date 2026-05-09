@@ -19,10 +19,13 @@ class CaptivePortal {
 public:
     /**
      * Start AP, host portal, blokkeer tot user klaar is of timeout verstrijkt.
+     * @param ethReady  Als true: WiFi-velden verbergen; claim gaat direct over
+     *                  ethernet. Als false: vraag WiFi-creds (oude flow).
      * @return true als pairing succesvol; false bij timeout.
      */
     bool run(const char* apSsid,
              const String& claimUrl,
+             bool ethReady = false,
              unsigned long timeoutMs = 5UL * 60UL * 1000UL);
 
     String apiKey() const { return _apiKey; }
@@ -59,6 +62,7 @@ private:
     String _apiKey;
     String _baseUrl;
     String _claimUrl;
+    bool _ethReady = false;
     unsigned long _stateChangedAt = 0;
     unsigned long _lastScanAt = 0;
 };

@@ -6,8 +6,10 @@
 
 extern const char PORTAL_HTML[] PROGMEM;
 
-bool CaptivePortal::run(const char* apSsid, const String& claimUrl, unsigned long timeoutMs) {
+bool CaptivePortal::run(const char* apSsid, const String& claimUrl, bool ethReady,
+                        unsigned long timeoutMs) {
     _claimUrl = claimUrl;
+    _ethReady = ethReady;
     _state = State::IDLE;
     _stateChangedAt = millis();
 
@@ -22,9 +24,12 @@ bool CaptivePortal::run(const char* apSsid, const String& claimUrl, unsigned lon
     _setupRoutes();
     _server.begin();
 
-    // Eerste scan triggeren — duurt ~3s, daarna asynchroon refreshen
-    WiFi.scanNetworks(true);
-    _lastScanAt = millis();
+    // Eerste scan triggeren — duurt ~3s, daarna asynchroon refreshen.
+    // Ethernet-flow heeft geen WiFi-keuzemenu, dus skip de scans.
+    if (!_ethReady) {
+        WiFi.scanNetworks(true);
+        _lastScanAt = millis();
+    }
 
     unsigned long deadline = millis() + timeoutMs;
     while (millis() < deadline) {
@@ -33,7 +38,7 @@ bool CaptivePortal::run(const char* apSsid, const String& claimUrl, unsigned lon
         _processBackground();
 
         // Periodiek opnieuw scannen zolang user nog op portal-pagina is
-        if (_state == State::IDLE && millis() - _lastScanAt > 15000) {
+        if (!_ethReady && _state == State::IDLE && millis() - _lastScanAt > 15000) {
             int n = WiFi.scanComplete();
             if (n != WIFI_SCAN_RUNNING) {
                 WiFi.scanDelete();
@@ -65,6 +70,12 @@ bool CaptivePortal::run(const char* apSsid, const String& claimUrl, unsigned lon
 
 void CaptivePortal::_setupRoutes() {
     _server.on("/", HTTP_GET, [this]() { _handleRoot(); });
+    _server.on("/state", HTTP_GET, [this]() {
+        // Vroeg in pageload: portal-page checkt of WiFi-velden nodig zijn.
+        String body = String("{\"eth_ready\":") + (_ethReady ? "true" : "false") + "}";
+        _server.sendHeader("Cache-Control", "no-store");
+        _server.send(200, "application/json", body);
+    });
     _server.on("/scan", HTTP_GET, [this]() { _handleScan(); });
     _server.on("/save", HTTP_POST, [this]() { _handleSave(); });
     _server.on("/status", HTTP_GET, [this]() { _handleStatus(); });
@@ -112,31 +123,39 @@ void CaptivePortal::_handleScan() {
 }
 
 void CaptivePortal::_handleSave() {
-    if (!_server.hasArg("ssid") || !_server.hasArg("code")) {
-        _server.send(400, "application/json", "{\"error\":\"missing_fields\"}");
+    if (!_server.hasArg("code")) {
+        _server.send(400, "application/json", "{\"error\":\"missing_code\"}");
         return;
     }
-    _ssid = _server.arg("ssid");
-    _password = _server.hasArg("password") ? _server.arg("password") : "";
     _code = _server.arg("code");
-
     if (_code.length() != 6) {
         _server.send(400, "application/json", "{\"error\":\"invalid_code\"}");
         return;
     }
-    if (_ssid.isEmpty()) {
+
+    _ssid = _server.hasArg("ssid") ? _server.arg("ssid") : "";
+    _password = _server.hasArg("password") ? _server.arg("password") : "";
+
+    // SSID alleen verplicht als er geen ethernet is — anders kan claim direct
+    // over de kabel.
+    if (!_ethReady && _ssid.isEmpty()) {
         _server.send(400, "application/json", "{\"error\":\"missing_ssid\"}");
         return;
     }
 
-    // Direct ack — verbinden gebeurt async in _processBackground()
-    _server.send(200, "application/json", "{\"status\":\"connecting_wifi\"}");
-
-    _state = State::CONNECTING_WIFI;
+    // Direct ack; werk gebeurt async in _processBackground().
     _stateChangedAt = millis();
-    WiFi.disconnect();
-    delay(100);
-    WiFi.begin(_ssid.c_str(), _password.c_str());
+    if (_ssid.isEmpty()) {
+        // Ethernet-only: skip WiFi-connect, ga direct claimen
+        _server.send(200, "application/json", "{\"status\":\"pairing\"}");
+        _state = State::PAIRING;
+    } else {
+        _server.send(200, "application/json", "{\"status\":\"connecting_wifi\"}");
+        _state = State::CONNECTING_WIFI;
+        WiFi.disconnect();
+        delay(100);
+        WiFi.begin(_ssid.c_str(), _password.c_str());
+    }
 }
 
 void CaptivePortal::_handleStatus() {
@@ -185,6 +204,14 @@ void CaptivePortal::_processBackground() {
             _state = State::ERROR_WIFI;
             _errorMsg = "Verbinden duurde te lang. Klopt het wachtwoord?";
             WiFi.disconnect();
+        }
+    } else if (_state == State::PAIRING) {
+        // Ethernet-only flow: claim direct (de WiFi-tak transitioneert PAIRING
+        // intern binnen één iteratie, dus deze branch raakt alleen ethernet).
+        if (_claim()) {
+            _state = State::SUCCESS;
+        } else {
+            _state = State::ERROR_PAIRING;
         }
     }
 }
@@ -380,16 +407,16 @@ const char PORTAL_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
   <header>
     <div class="logo">S</div>
     <h1>P1-bridge instellen</h1>
-    <p class="subtitle">Verbind je SlimHuys-bridge met je netwerk</p>
+    <p class="subtitle" id="subtitle">Verbind je SlimHuys-bridge met je netwerk</p>
   </header>
 
   <div id="form-card" class="card">
-    <div class="field">
+    <div class="field" id="wifi-fields">
       <label for="ssid">WiFi-netwerk</label>
       <select id="ssid"><option value="" disabled selected>Netwerken zoeken…</option></select>
     </div>
 
-    <div class="field">
+    <div class="field" id="pass-field">
       <label for="password">WiFi-wachtwoord</label>
       <input type="password" id="password" autocomplete="off">
     </div>
@@ -422,6 +449,30 @@ const char PORTAL_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
   var statusEl = document.getElementById('status-card');
   var titleEl = document.getElementById('status-title');
   var msgEl = document.getElementById('status-message');
+  var wifiFieldsEl = document.getElementById('wifi-fields');
+  var passFieldEl = document.getElementById('pass-field');
+  var subtitleEl = document.getElementById('subtitle');
+
+  // ethReady wordt door /state gezet vóór updateBtn() betekenis krijgt.
+  // Default false (= WiFi nodig) zodat het oude gedrag blijft als /state faalt.
+  var ethReady = false;
+
+  function loadState() {
+    fetch('/state').then(function(r){return r.json();}).then(function(d){
+      ethReady = !!d.eth_ready;
+      if (ethReady) {
+        wifiFieldsEl.classList.add('hidden');
+        passFieldEl.classList.add('hidden');
+        subtitleEl.textContent = 'Vul je pairing-code in om je bridge te koppelen';
+      } else {
+        loadNetworks();
+      }
+      updateBtn();
+    }).catch(function(){
+      // Fallback: ga uit van WiFi-flow
+      loadNetworks();
+    });
+  }
 
   function loadNetworks() {
     fetch('/scan').then(function(r){return r.json();}).then(function(d){
@@ -450,7 +501,8 @@ const char PORTAL_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
   }
 
   function updateBtn() {
-    btnEl.disabled = !(ssidEl.value && codeEl.value.length === 6);
+    var codeOk = codeEl.value.length === 6;
+    btnEl.disabled = !codeOk || (!ethReady && !ssidEl.value);
   }
 
   codeEl.addEventListener('input', function(e){
@@ -478,12 +530,16 @@ const char PORTAL_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
   }
 
   btnEl.addEventListener('click', function(){
-    var body = 'ssid=' + encodeURIComponent(ssidEl.value)
-             + '&password=' + encodeURIComponent(passEl.value)
+    var body = 'ssid=' + encodeURIComponent(ssidEl.value || '')
+             + '&password=' + encodeURIComponent(passEl.value || '')
              + '&code=' + encodeURIComponent(codeEl.value);
     formEl.classList.add('hidden');
     statusEl.classList.remove('hidden');
-    setStatus('info', 'Verbinden met WiFi…', 'Even geduld, dit duurt ongeveer 10 seconden.');
+    if (ethReady) {
+      setStatus('info', 'Koppelen aan SlimHuys…', 'Code wordt gevalideerd.');
+    } else {
+      setStatus('info', 'Verbinden met WiFi…', 'Even geduld, dit duurt ongeveer 10 seconden.');
+    }
     fetch('/save', {
       method: 'POST',
       headers: {'Content-Type': 'application/x-www-form-urlencoded'},
@@ -519,7 +575,7 @@ const char PORTAL_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
     });
   }
 
-  loadNetworks();
+  loadState();
 })();
 </script>
 </body>
