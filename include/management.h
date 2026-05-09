@@ -50,6 +50,11 @@ public:
     void recordParse(bool ok, const String& error = String());
     void setLastReading(const LastReading& r) { _lastReading = r; }
     void setLeakDetected(bool detected) { _leakDetected = detected; }
+    void setEnvReading(float temp_c, float humid_pct) {
+        _envTempC = temp_c;
+        _envHumidPct = humid_pct;
+        _envValid = true;
+    }
 
 private:
     void _setupRoutes();
@@ -93,4 +98,8 @@ private:
     // Onafhankelijk van P1-state: leak-sensor moet ook werken zonder
     // DSMR-telegrammen, dus losse veld i.p.v. in LastReading.
     bool _leakDetected = false;
+    // HDC1080 omgevings-readings (T+H), eveneens los van P1.
+    bool _envValid = false;
+    float _envTempC = 0;
+    float _envHumidPct = 0;
 };

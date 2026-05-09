@@ -8,9 +8,13 @@
  * Pin-mapping (smarthomeshop WaterP1MeterKit V3):
  *   GPIO 16 ← P1-data (software-inverted UART, geen NPN nodig)
  *   GPIO 12 → P1-request (data-trigger naar slimme meter)
- *   GPIO 13 → groene LED van de RGB-indicator (ETH-status)
+ *   GPIO 5  → RGB-indicator: rood kanaal (LEDC PWM)
+ *   GPIO 13 → RGB-indicator: groen kanaal
+ *   GPIO 14 → RGB-indicator: blauw kanaal
  *   GPIO 32 ← water-pulse (reed-switch, 1 puls = 1L default)
  *   GPIO 2  ← waterlek-sensor (active-low, INPUT_PULLUP)
+ *   GPIO 15 ↔ I²C SDA (HDC1080 temp+vocht)
+ *   GPIO 4  → I²C SCL
  *   LAN8720 PHY → ethernet RJ45 (MDC=23, MDIO=18, CLK=17_OUT, PWR=33, addr=1)
  *
  * Provisioning: bij eerste boot start een captive-portal op SSID
@@ -26,6 +30,8 @@
 #include <ArduinoJson.h>
 #include <Preferences.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <Wire.h>
 #include <dsmr.h>
 #include <driver/uart.h>
 #include <time.h>
@@ -41,9 +47,18 @@ using namespace dsmr::fields;
 // ============================================================================
 constexpr int P1_RX_PIN = 16;       // DSMR-data (software-inverted UART)
 constexpr int P1_REQUEST_PIN = 12;  // Data-trigger naar slimme meter (DTR)
-constexpr int LED_PIN = 13;         // Groene kanaal van de RGB-indicator
+constexpr int LED_R_PIN = 5;        // Rood kanaal RGB-indicator
+constexpr int LED_G_PIN = 13;       // Groen kanaal
+constexpr int LED_B_PIN = 14;       // Blauw kanaal
+constexpr int LEDC_CH_R = 0;
+constexpr int LEDC_CH_G = 1;
+constexpr int LEDC_CH_B = 2;
 constexpr int WATER_PULSE_PIN = 32; // Reed-switch op water-meter
 constexpr int WATER_LEAK_PIN = 2;   // Lekkage-sensor (LOW=leak, INPUT_PULLUP)
+constexpr int I2C_SDA_PIN = 15;     // HDC1080 temp+vocht
+constexpr int I2C_SCL_PIN = 4;
+constexpr uint8_t HDC1080_ADDR = 0x40;
+constexpr unsigned long HDC_READ_INTERVAL_MS = 30000; // 1×/30s — ruim genoeg
 constexpr unsigned long LEAK_DEBOUNCE_MS = 100; // stabiele-tijd voor commit
 constexpr int PUSH_INTERVAL_MS = 1000;             // P1: 1Hz
 constexpr int WATER_PUSH_THROTTLE_MS = 1000;       // Water: max 1Hz bij verandering
@@ -93,12 +108,125 @@ bool leakRawState = false;
 bool leakStableState = false;
 unsigned long leakChangedAt = 0;
 
+// HDC1080 omgevings-readings — 1×/30s naar management gepusht
+unsigned long lastHdcReadAt = 0;
+bool hdcPresent = false;  // gezet bij eerste succesvolle init
+
+// Persistente TLS-client voor HTTPClient. Eén instance hergebruiken
+// betekent dat lwIP/mbedtls de TLS-sessie ID kan cachen — bij volgende
+// requests slaat 't de zware public-key handshake over (~300ms → ~50ms).
+WiFiClientSecure secureClient;
+
+// LED-state-machine. LEDC PWM doet de blinks autonoom in hardware,
+// dus de loop hoeft niks te toggle'en. Mode-transitions schrijven alleen
+// nieuwe frequenties + duty naar de channels.
+enum class LedMode {
+    BOOT,           // groene continue (alles ok bij boot)
+    PAIRING,        // blauwe pulse — captive-portal actief
+    OPERATIONAL,    // groene continue
+    ERROR,          // rode continue — geen netwerk of repeated push fail
+    LEAK_ALARM,     // rode snelle blink — overruled alle andere
+};
+LedMode currentLedMode = LedMode::BOOT;
+
 void IRAM_ATTR onWaterPulse() {
     unsigned long now = micros();
     // Reed-switches bouncen ~10-30ms — we negeren transitions binnen 50ms.
     if (now - lastPulseUs < WATER_DEBOUNCE_US) return;
     lastPulseUs = now;
     waterPulseCount++;
+}
+
+// Forward-decl — pickLedMode() heeft 'm nodig vóórdat networkReady() definitief
+// gedefinieerd is verderop.
+bool networkReady();
+
+// ============================================================================
+// LED-state machine
+// ----------------------------------------------------------------------------
+// LEDC werkt op een channel-per-pin pattern: één-keer ledcAttachPin in
+// initLeds(), daarna elke mode-transition gewoon ledcSetup (frequency)
+// + ledcWrite (duty). Hardware doet de blink, geen Ticker nodig.
+// ============================================================================
+static void ledWrite(int channel, uint32_t freq_hz, uint8_t duty) {
+    ledcSetup(channel, freq_hz, 8);
+    ledcWrite(channel, duty);
+}
+
+void setLedMode(LedMode mode) {
+    if (mode == currentLedMode) return;
+    currentLedMode = mode;
+
+    // Reset alle kanalen naar uit
+    ledWrite(LEDC_CH_R, 5000, 0);
+    ledWrite(LEDC_CH_G, 5000, 0);
+    ledWrite(LEDC_CH_B, 5000, 0);
+
+    switch (mode) {
+        case LedMode::BOOT:
+        case LedMode::OPERATIONAL:
+            ledWrite(LEDC_CH_G, 5000, 255);  // groen continu
+            break;
+        case LedMode::PAIRING:
+            ledWrite(LEDC_CH_B, 1, 128);     // 1Hz pulse blauw
+            break;
+        case LedMode::ERROR:
+            ledWrite(LEDC_CH_R, 5000, 255);  // rood continu
+            break;
+        case LedMode::LEAK_ALARM:
+            ledWrite(LEDC_CH_R, 4, 128);     // 4Hz blink rood
+            break;
+    }
+}
+
+void initLeds() {
+    ledcAttachPin(LED_R_PIN, LEDC_CH_R);
+    ledcAttachPin(LED_G_PIN, LEDC_CH_G);
+    ledcAttachPin(LED_B_PIN, LEDC_CH_B);
+    setLedMode(LedMode::BOOT);
+}
+
+// Bepaal de gewenste mode op basis van runtime-state. Wordt periodiek
+// in loop() aangeroepen. Pairing wordt expliciet gezet rond portal.run().
+LedMode pickLedMode() {
+    if (leakStableState) return LedMode::LEAK_ALARM;
+    if (!networkReady()) return LedMode::ERROR;
+    return LedMode::OPERATIONAL;
+}
+
+// ============================================================================
+// HDC1080 — temperatuur + vocht via I²C
+// ============================================================================
+bool hdc1080Init() {
+    Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+    Wire.setClock(100000);
+
+    // CONFIG register (0x02): MODE=1 (T then RH sequentieel), 14-bit elk,
+    // heater off. Eerste byte 0x10, tweede 0x00.
+    Wire.beginTransmission(HDC1080_ADDR);
+    Wire.write(0x02);
+    Wire.write(0x10);
+    Wire.write(0x00);
+    return Wire.endTransmission() == 0;
+}
+
+bool hdc1080Read(float& temp_c, float& humid_pct) {
+    // Trigger meting door pointer-register naar 0x00 te schrijven
+    Wire.beginTransmission(HDC1080_ADDR);
+    Wire.write(0x00);
+    if (Wire.endTransmission() != 0) return false;
+
+    // 14-bit T + 14-bit RH ≈ 13ms acquisition
+    delay(15);
+
+    Wire.requestFrom((uint8_t)HDC1080_ADDR, (uint8_t)4);
+    if (Wire.available() < 4) return false;
+    uint16_t tRaw = ((uint16_t)Wire.read() << 8) | Wire.read();
+    uint16_t hRaw = ((uint16_t)Wire.read() << 8) | Wire.read();
+
+    temp_c = ((float)tRaw / 65536.0f) * 165.0f - 40.0f;
+    humid_pct = ((float)hRaw / 65536.0f) * 100.0f;
+    return true;
 }
 
 // Bouwt een uniek hostname zoals "slimhuys-p1-dd4240" — laatste 3 MAC-bytes
@@ -155,11 +283,11 @@ void onNetworkEvent(WiFiEvent_t event) {
             Serial.print("ETH IP: ");
             Serial.println(ETH.localIP());
             ethConnected = true;
-            digitalWrite(LED_PIN, HIGH);
+            // LED-mode wordt door de loop's pickLedMode() opgepakt; geen
+            // directe digitalWrite hier nodig.
             break;
         case ARDUINO_EVENT_ETH_DISCONNECTED:
             ethConnected = false;
-            digitalWrite(LED_PIN, LOW);
             break;
         default:
             break;
@@ -286,7 +414,8 @@ void pushReading(P1Data& d) {
     serializeJson(doc, payload);
 
     HTTPClient http;
-    http.begin(baseUrl + "/v1/me/readings");
+    http.setReuse(true);
+    http.begin(secureClient, baseUrl + "/v1/me/readings");
     http.addHeader("Authorization", "Bearer " + apiKey);
     http.addHeader("Content-Type", "application/json");
     http.addHeader("User-Agent", "slimhuys-p1/" FIRMWARE_VERSION);
@@ -332,7 +461,8 @@ void pushManagementInfo() {
     serializeJson(doc, payload);
 
     HTTPClient http;
-    http.begin(baseUrl + "/v1/me/bridges/management");
+    http.setReuse(true);
+    http.begin(secureClient, baseUrl + "/v1/me/bridges/management");
     http.addHeader("Authorization", "Bearer " + apiKey);
     http.addHeader("Content-Type", "application/json");
     http.addHeader("User-Agent", "slimhuys-p1/" FIRMWARE_VERSION);
@@ -367,7 +497,8 @@ void pushWaterReading(uint32_t total_l) {
     serializeJson(doc, payload);
 
     HTTPClient http;
-    http.begin(baseUrl + "/v1/me/water-readings");
+    http.setReuse(true);
+    http.begin(secureClient, baseUrl + "/v1/me/water-readings");
     http.addHeader("Authorization", "Bearer " + apiKey);
     http.addHeader("Content-Type", "application/json");
     http.addHeader("User-Agent", "slimhuys-p1/" FIRMWARE_VERSION);
@@ -388,10 +519,17 @@ void pushWaterReading(uint32_t total_l) {
 // Setup + loop
 // ============================================================================
 void setup() {
-    pinMode(LED_PIN, OUTPUT);
-    digitalWrite(LED_PIN, LOW);
     Serial.begin(115200);
     Serial.println("\n=== SlimHuys P1-bridge v" FIRMWARE_VERSION " ===");
+
+    // RGB-indicator zo vroeg mogelijk: gebruiker ziet meteen of de bridge
+    // boot. Groen = boot/operational, blauw-pulse = pairing, rood = error,
+    // rood-blink = leak. Wordt verder door de loop bijgehouden.
+    initLeds();
+
+    // Persistente HTTPS-client zonder cert-pinning (slimhuys.nl is publieke
+    // CA, een MITM op het lokale net is niet ons dreigingsmodel).
+    secureClient.setInsecure();
 
     // Config laden uit NVS
     prefs.begin("slimhuys", false);
@@ -409,6 +547,11 @@ void setup() {
     // Lek-sensor: active-low (sensor pulled-up via interne resistor, lek = LOW).
     // GPIO2 is een strapping pin maar runtime-gebruik als input is veilig.
     pinMode(WATER_LEAK_PIN, INPUT_PULLUP);
+
+    // HDC1080 initialiseren — fail-soft: als 't fail't (bv. defect, niet
+    // gemonteerd) draait alles verder gewoon zonder env-readings.
+    hdcPresent = hdc1080Init();
+    Serial.printf("HDC1080: %s\n", hdcPresent ? "ok" : "niet gevonden");
 
     // Hostname opbouwen vóór WiFi/ETH starten — anders kondigt 't bord
     // zich aan als "esp32-XXXXXX" / "espressif" in de DHCP-tabel.
@@ -456,12 +599,14 @@ void setup() {
     // Geen netwerk OF nog niet ge-paired? Start captive-portal voor setup.
     if (!networkReady() || apiKey.isEmpty()) {
         Serial.println("Captive portal start (geen netwerk of geen api-key)");
+        setLedMode(LedMode::PAIRING);  // blauw pulserend tot pairing klaar is
         CaptivePortal portal;
         String claimUrl = String(SLIMHUYS_BASE_URL) + "/v1/bridges/claim";
         // Ethernet-state doorgeven zodat het portaal alleen om de pairing-code
         // hoeft te vragen als de kabel al up is.
         if (!portal.run("SlimHuys-Setup", claimUrl, ethConnected)) {
             Serial.println("Portal timeout/error — reboot in 5s");
+            setLedMode(LedMode::ERROR);
             delay(5000);
             ESP.restart();
         }
@@ -554,6 +699,19 @@ void loop() {
         Serial.printf("Lekkage-sensor: %s\n", leakStableState ? "GEDETECTEERD" : "geen");
         management.setLeakDetected(leakStableState);
     }
+
+    // HDC1080: 1×/30s temp+vocht binnenhalen en aan management doorgeven.
+    if (hdcPresent && now - lastHdcReadAt >= HDC_READ_INTERVAL_MS) {
+        float temp_c, humid_pct;
+        if (hdc1080Read(temp_c, humid_pct)) {
+            management.setEnvReading(temp_c, humid_pct);
+        }
+        lastHdcReadAt = now;
+    }
+
+    // LED-mode hertonen op basis van runtime-state. PAIRING wordt apart
+    // gezet rond portal.run(); deze tak handelt LEAK/ERROR/OPERATIONAL.
+    setLedMode(pickLedMode());
 
     // Diagnostiek: tel bytes vóór reader 'r consumeert
     int avail = P1Serial.available();
