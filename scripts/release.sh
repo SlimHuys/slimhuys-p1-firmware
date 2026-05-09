@@ -25,6 +25,9 @@ mkdir -p "$OUT"
 cp .pio/build/smarthomeshop-v3/firmware.bin        "$OUT/firmware.bin"
 cp .pio/build/smarthomeshop-v3/firmware-merged.bin "$OUT/firmware-merged.bin"
 
+# Sha256 sidecar voor OTA-integriteitscheck door de bridge.
+shasum -a 256 "$OUT/firmware.bin" | awk '{print $1}' > "$OUT/firmware.bin.sha256"
+
 cat > "$OUT/manifest.json" <<EOF
 {
   "name": "SlimHuys P1-bridge",

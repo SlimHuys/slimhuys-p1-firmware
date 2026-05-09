@@ -48,6 +48,10 @@ jobs:
           cp .pio/build/smarthomeshop-v3/firmware.bin        release/firmware.bin
           cp .pio/build/smarthomeshop-v3/firmware-merged.bin release/firmware-merged.bin
 
+          # Sha256 sidecar voor OTA-integriteitscheck door de bridge
+          # (slimhuys.nl/v1/firmware/manifest leest dit en stuurt het mee).
+          sha256sum release/firmware.bin | awk '{print $1}' > release/firmware.bin.sha256
+
           BIN_URL="https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/firmware-merged.bin"
 
           cat > release/manifest.json <<EOF
@@ -73,6 +77,7 @@ jobs:
         with:
           files: |
             release/firmware.bin
+            release/firmware.bin.sha256
             release/firmware-merged.bin
             release/manifest.json
           generate_release_notes: true
