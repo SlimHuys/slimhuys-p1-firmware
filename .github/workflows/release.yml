@@ -35,7 +35,7 @@ jobs:
       - name: Verify version matches tag
         run: |
           TAG_VERSION="${GITHUB_REF_NAME#v}"
-          FW_VERSION=$(awk -F'\\"' '/FIRMWARE_VERSION/ {print $2}' platformio.ini)
+          FW_VERSION=$(grep FIRMWARE_VERSION platformio.ini | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
           if [[ "$TAG_VERSION" != "$FW_VERSION" ]]; then
             echo "Tag $GITHUB_REF_NAME komt niet overeen met FIRMWARE_VERSION=$FW_VERSION in platformio.ini" >&2
             exit 1

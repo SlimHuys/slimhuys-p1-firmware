@@ -10,7 +10,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-VERSION=$(awk -F'\\\\"' '/FIRMWARE_VERSION/ {print $2}' platformio.ini)
+VERSION=$(grep FIRMWARE_VERSION platformio.ini | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
 if [[ -z "$VERSION" ]]; then
   echo "FIRMWARE_VERSION niet gevonden in platformio.ini" >&2
   exit 1
