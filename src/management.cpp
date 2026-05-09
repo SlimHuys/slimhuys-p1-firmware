@@ -122,6 +122,7 @@ void ManagementInterface::_handleStatus() {
     water["push_fail_count"] = _waterPushFail;
 
     doc["water_leak"] = _leakDetected;
+    doc["water_flow_lpm"] = _waterFlowLpm;
 
     if (_envValid) {
         JsonObject env = doc["env"].to<JsonObject>();
@@ -468,6 +469,10 @@ const char MANAGEMENT_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
       <div class="row-value" id="water">—</div>
     </div>
     <div class="row">
+      <div class="row-label">Stroming</div>
+      <div class="row-value" id="water-flow">—</div>
+    </div>
+    <div class="row">
       <div class="row-label">Lekkage</div>
       <div class="row-value" id="leak">…</div>
     </div>
@@ -620,6 +625,11 @@ function refresh() {
     } else {
       leakEl.innerHTML = dot('ok') + 'Geen lekkage';
     }
+
+    var flow = d.water_flow_lpm || 0;
+    document.getElementById('water-flow').textContent = flow >= 0.5
+      ? fmtNum(flow, 1) + ' L/min'
+      : 'Stilstand';
 
     if (d.env) {
       document.getElementById('env-temp').textContent = fmtNum(d.env.temp_c, 1) + ' °C';

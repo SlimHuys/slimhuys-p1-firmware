@@ -50,6 +50,7 @@ public:
     void recordParse(bool ok, const String& error = String());
     void setLastReading(const LastReading& r) { _lastReading = r; }
     void setLeakDetected(bool detected) { _leakDetected = detected; }
+    void setWaterFlow(float lpm) { _waterFlowLpm = lpm; }
     void setEnvReading(float temp_c, float humid_pct) {
         _envTempC = temp_c;
         _envHumidPct = humid_pct;
@@ -98,6 +99,8 @@ private:
     // Onafhankelijk van P1-state: leak-sensor moet ook werken zonder
     // DSMR-telegrammen, dus losse veld i.p.v. in LastReading.
     bool _leakDetected = false;
+    // Live water-flow rate (L/min), gemeten via 10s sliding window.
+    float _waterFlowLpm = 0;
     // HDC1080 omgevings-readings (T+H), eveneens los van P1.
     bool _envValid = false;
     float _envTempC = 0;

@@ -59,7 +59,18 @@ constexpr int I2C_SDA_PIN = 15;     // HDC1080 temp+vocht
 constexpr int I2C_SCL_PIN = 4;
 constexpr uint8_t HDC1080_ADDR = 0x40;
 constexpr unsigned long HDC_READ_INTERVAL_MS = 30000; // 1×/30s — ruim genoeg
-constexpr unsigned long LEAK_DEBOUNCE_MS = 100; // stabiele-tijd voor commit
+// Self-heating compensatie — HDC1080 zit naast de ESP32 die warmte+droogte
+// produceert. Offsets uit smarthomeshop's eigen ESPHome-config (klopt met
+// onze hardware, geen reden om te tweaken).
+constexpr float HDC_TEMP_OFFSET_C = -4.5f;
+constexpr float HDC_HUMID_OFFSET_PCT = 12.0f;
+// Asymmetrische leak-debounce: snel triggeren (100ms), traag herstellen (2s)
+// zodat een opdrogend druppeltje het alarm niet uit-flickert.
+constexpr unsigned long LEAK_ON_DEBOUNCE_MS = 100;
+constexpr unsigned long LEAK_OFF_DEBOUNCE_MS = 2000;
+// Sliding window voor live water-flow (L/min). 10s-buffer geeft snelle
+// reactie zonder al te jittery rate.
+constexpr int FLOW_WINDOW_S = 10;
 constexpr int PUSH_INTERVAL_MS = 1000;             // P1: 1Hz
 constexpr int WATER_PUSH_THROTTLE_MS = 1000;       // Water: max 1Hz bij verandering
 constexpr int WATER_PUSH_HEARTBEAT_MS = 60000;     // Water: periodiek ook bij stilstand
@@ -111,6 +122,14 @@ unsigned long leakChangedAt = 0;
 // HDC1080 omgevings-readings — 1×/30s naar management gepusht
 unsigned long lastHdcReadAt = 0;
 bool hdcPresent = false;  // gezet bij eerste succesvolle init
+
+// Live water-flow ring-buffer: één snapshot per seconde, oudste = "10s
+// geleden". Pre-fill met de bootCount in setup() zodat warmup-fase
+// 0 L/min toont i.p.v. een sprong vanuit 0.
+uint32_t flowSamples[FLOW_WINDOW_S] = {0};
+int flowSampleIdx = 0;
+unsigned long lastFlowSampleAt = 0;
+float currentFlowLpm = 0.0f;
 
 // Persistente TLS-client voor HTTPClient. Eén instance hergebruiken
 // betekent dat lwIP/mbedtls de TLS-sessie ID kan cachen — bij volgende
@@ -224,8 +243,12 @@ bool hdc1080Read(float& temp_c, float& humid_pct) {
     uint16_t tRaw = ((uint16_t)Wire.read() << 8) | Wire.read();
     uint16_t hRaw = ((uint16_t)Wire.read() << 8) | Wire.read();
 
-    temp_c = ((float)tRaw / 65536.0f) * 165.0f - 40.0f;
-    humid_pct = ((float)hRaw / 65536.0f) * 100.0f;
+    temp_c = ((float)tRaw / 65536.0f) * 165.0f - 40.0f + HDC_TEMP_OFFSET_C;
+    humid_pct = ((float)hRaw / 65536.0f) * 100.0f + HDC_HUMID_OFFSET_PCT;
+    // Klamp humid-pct in geval calibratie 'm boven 100% of onder 0% duwt
+    // bij extremen (zelden, maar kan gebeuren bij self-heating boundary).
+    if (humid_pct > 100.0f) humid_pct = 100.0f;
+    if (humid_pct < 0.0f) humid_pct = 0.0f;
     return true;
 }
 
@@ -539,6 +562,11 @@ void setup() {
     lastPersistedTotal = waterPulseCount;  // start in sync met NVS
     Serial.printf("Water-counter geladen: %u L\n", (unsigned)waterPulseCount);
 
+    // Flow-window pre-fillen: alle samples = current count → delta=0 →
+    // flow=0 tot er echt iets stroomt. Voorkomt sprong vanuit 0 in de
+    // eerste 10s na boot.
+    for (int i = 0; i < FLOW_WINDOW_S; i++) flowSamples[i] = waterPulseCount;
+
     // Pulse-input: pull-up + falling edge ISR. Doen we vroeg in setup() zodat
     // pulses tijdens captive-portal of NTP-sync niet verloren gaan.
     pinMode(WATER_PULSE_PIN, INPUT_PULLUP);
@@ -687,17 +715,20 @@ void loop() {
         lastWaterPersistAt = now;
     }
 
-    // Lek-sensor: poll + 100ms debounce. Pas commit als raw-state stabiel is,
-    // zodat een vluchtige glitch geen alert geeft.
+    // Lek-sensor: asymmetrische debounce — snel triggeren (100ms), traag
+    // herstellen (2s) zodat een opdrogend kontact 't alarm niet uitflikkert.
     bool leakRaw = (digitalRead(WATER_LEAK_PIN) == LOW);
     if (leakRaw != leakRawState) {
         leakRawState = leakRaw;
         leakChangedAt = now;
     }
-    if (leakRawState != leakStableState && now - leakChangedAt >= LEAK_DEBOUNCE_MS) {
-        leakStableState = leakRawState;
-        Serial.printf("Lekkage-sensor: %s\n", leakStableState ? "GEDETECTEERD" : "geen");
-        management.setLeakDetected(leakStableState);
+    if (leakRawState != leakStableState) {
+        unsigned long required = leakRawState ? LEAK_ON_DEBOUNCE_MS : LEAK_OFF_DEBOUNCE_MS;
+        if (now - leakChangedAt >= required) {
+            leakStableState = leakRawState;
+            Serial.printf("Lekkage-sensor: %s\n", leakStableState ? "GEDETECTEERD" : "geen");
+            management.setLeakDetected(leakStableState);
+        }
     }
 
     // HDC1080: 1×/30s temp+vocht binnenhalen en aan management doorgeven.
@@ -707,6 +738,18 @@ void loop() {
             management.setEnvReading(temp_c, humid_pct);
         }
         lastHdcReadAt = now;
+    }
+
+    // Live water-flow sliding window. Sample 1×/sec; oudste in ring is
+    // exact 10s geleden, dus delta = pulses-in-window. ×6 → L/min.
+    if (now - lastFlowSampleAt >= 1000) {
+        int oldestIdx = (flowSampleIdx + 1) % FLOW_WINDOW_S;
+        uint32_t deltaPulses = waterPulseCount - flowSamples[oldestIdx];
+        currentFlowLpm = (float)deltaPulses * (60.0f / FLOW_WINDOW_S);
+        flowSamples[flowSampleIdx] = waterPulseCount;
+        flowSampleIdx = (flowSampleIdx + 1) % FLOW_WINDOW_S;
+        lastFlowSampleAt = now;
+        management.setWaterFlow(currentFlowLpm);
     }
 
     // LED-mode hertonen op basis van runtime-state. PAIRING wordt apart
