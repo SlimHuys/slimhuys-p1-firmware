@@ -38,6 +38,13 @@ void ManagementInterface::recordWaterPush(int httpStatus) {
     else _waterPushFail++;
 }
 
+void ManagementInterface::recordLeakPush(int httpStatus) {
+    _lastLeakPushStatus = httpStatus;
+    _lastLeakPushAt = millis();
+    if (httpStatus == 204 || httpStatus == 200) _leakPushOk++;
+    else _leakPushFail++;
+}
+
 void ManagementInterface::recordParse(bool ok, const String& error) {
     _lastParseOk = ok;
     _lastParseAt = millis();
@@ -121,6 +128,13 @@ void ManagementInterface::_handleStatus() {
     water["push_ok_count"] = _waterPushOk;
     water["push_fail_count"] = _waterPushFail;
 
+    JsonObject leak = doc["leak_api"].to<JsonObject>();
+    leak["last_status"] = _lastLeakPushStatus;
+    leak["last_at_ms_ago"] = _lastLeakPushAt > 0 ? (long)(millis() - _lastLeakPushAt) : -1;
+    leak["push_ok_count"] = _leakPushOk;
+    leak["push_fail_count"] = _leakPushFail;
+
+    doc["safe_mode"] = _safeMode;
     doc["water_leak"] = _leakDetected;
     doc["water_flow_lpm"] = _waterFlowLpm;
 
@@ -513,6 +527,10 @@ const char MANAGEMENT_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
       <div class="row-value" id="water-api">…</div>
     </div>
     <div class="row">
+      <div class="row-label">Leak push</div>
+      <div class="row-value" id="leak-api">…</div>
+    </div>
+    <div class="row">
       <div class="row-label">Uptime</div>
       <div class="row-value" id="uptime">…</div>
     </div>
@@ -616,8 +634,9 @@ function refresh() {
         + 'HTTP ' + x.last_status + ' · ' + fmtAgo(x.last_at_ms_ago)
         + ' (' + x.push_ok_count + '/' + (x.push_ok_count + x.push_fail_count) + ')';
     }
-    renderPush(document.getElementById('api'),       d.api,   'Nog niet gepusht');
-    renderPush(document.getElementById('water-api'), d.water, 'Nog niet gepusht');
+    renderPush(document.getElementById('api'),       d.api,      'Nog niet gepusht');
+    renderPush(document.getElementById('water-api'), d.water,    'Nog niet gepusht');
+    renderPush(document.getElementById('leak-api'),  d.leak_api, 'Nog niet gepusht');
 
     var leakEl = document.getElementById('leak');
     if (d.water_leak) {

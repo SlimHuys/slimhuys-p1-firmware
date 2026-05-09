@@ -47,7 +47,9 @@ public:
     // Telemetrie-hooks vanuit main-loop
     void recordPush(int httpStatus);
     void recordWaterPush(int httpStatus);
+    void recordLeakPush(int httpStatus);
     void recordParse(bool ok, const String& error = String());
+    void setSafeMode(bool enabled) { _safeMode = enabled; }
     void setLastReading(const LastReading& r) { _lastReading = r; }
     void setLeakDetected(bool detected) { _leakDetected = detected; }
     void setWaterFlow(float lpm) { _waterFlowLpm = lpm; }
@@ -85,6 +87,13 @@ private:
     unsigned long _lastWaterPushAt = 0;
     uint32_t _waterPushOk = 0;
     uint32_t _waterPushFail = 0;
+
+    int _lastLeakPushStatus = 0;
+    unsigned long _lastLeakPushAt = 0;
+    uint32_t _leakPushOk = 0;
+    uint32_t _leakPushFail = 0;
+
+    bool _safeMode = false;
 
     bool _lastParseOk = true;
     String _lastParseError;

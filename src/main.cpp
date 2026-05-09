@@ -34,6 +34,8 @@
 #include <Wire.h>
 #include <dsmr.h>
 #include <driver/uart.h>
+#include <esp_task_wdt.h>
+#include <esp_system.h>
 #include <time.h>
 
 #include "management.h"
@@ -71,6 +73,11 @@ constexpr unsigned long LEAK_OFF_DEBOUNCE_MS = 2000;
 // Sliding window voor live water-flow (L/min). 10s-buffer geeft snelle
 // reactie zonder al te jittery rate.
 constexpr int FLOW_WINDOW_S = 10;
+
+// Watchdog + bootloop recovery
+constexpr uint32_t WDT_TIMEOUT_S = 30;          // ruim boven HTTPClient TLS-handshake
+constexpr uint32_t BOOTLOOP_THRESHOLD = 3;       // 3 crashes-in-een-rij → safe-mode
+constexpr unsigned long BOOTLOOP_GRACE_MS = 60000; // na 60s uptime = "succesvol gebooten"
 constexpr int PUSH_INTERVAL_MS = 1000;             // P1: 1Hz
 constexpr int WATER_PUSH_THROTTLE_MS = 1000;       // Water: max 1Hz bij verandering
 constexpr int WATER_PUSH_HEARTBEAT_MS = 60000;     // Water: periodiek ook bij stilstand
@@ -141,6 +148,17 @@ int flowSampleIdx = 0;
 unsigned long lastFlowSampleAt = 0;
 float currentFlowLpm = 0.0f;
 
+// Cyan-flash op water-pulse — bevestigt visueel aan de gebruiker dat
+// de meter live registreert. ISR signal'ert, loop voert de flash uit.
+volatile bool waterPulseFlashRequested = false;
+unsigned long waterPulseFlashUntil = 0;
+
+// Bootloop-detectie. crash_count wordt bij elke boot ge-increment;
+// na 60s succesvolle uptime reset we 'm. ≥3 wordt als "kapot" gezien
+// → safe-mode (alleen management-UI, geen pushes/portal).
+bool safeMode = false;
+bool bootloopGraceCleared = false;
+
 // Persistente TLS-client voor HTTPClient. Eén instance hergebruiken
 // betekent dat lwIP/mbedtls de TLS-sessie ID kan cachen — bij volgende
 // requests slaat 't de zware public-key handshake over (~300ms → ~50ms).
@@ -164,6 +182,7 @@ void IRAM_ATTR onWaterPulse() {
     if (now - lastPulseUs < WATER_DEBOUNCE_US) return;
     lastPulseUs = now;
     waterPulseCount++;
+    waterPulseFlashRequested = true;
 }
 
 // Forward-decl — pickLedMode() heeft 'm nodig vóórdat networkReady() definitief
@@ -487,6 +506,7 @@ void pushManagementInfo() {
 
     JsonDocument doc;
     doc["host"] = currentIp;
+    doc["hostname"] = deviceHostname + ".local";  // mDNS-handle als alternatief op IP
     doc["username"] = "admin";
     doc["password"] = adminPass;
 
@@ -540,6 +560,7 @@ int pushLeakState(bool detected) {
     int code = http.POST(payload);
     http.end();
     Serial.printf("Leak-POST (%s): HTTP %d\n", detected ? "WET" : "DRY", code);
+    management.recordLeakPush(code);
     return code;
 }
 
@@ -587,11 +608,27 @@ void pushWaterReading(uint32_t total_l) {
 void setup() {
     Serial.begin(115200);
     Serial.println("\n=== SlimHuys P1-bridge v" FIRMWARE_VERSION " ===");
+    Serial.printf("Reset reason: %d\n", (int)esp_reset_reason());
 
     // RGB-indicator zo vroeg mogelijk: gebruiker ziet meteen of de bridge
     // boot. Groen = boot/operational, blauw-pulse = pairing, rood = error,
     // rood-blink = leak. Wordt verder door de loop bijgehouden.
     initLeds();
+
+    // Bootloop-counter ophogen vóór risky init. Wordt op 0 gezet zodra
+    // we 60s succesvol draaien. 3+ in een rij = ga in safe-mode zodat
+    // de gebruiker via management-UI kan factory-resetten.
+    Preferences bootPrefs;
+    bootPrefs.begin("slimhuys", false);
+    uint32_t crashCount = bootPrefs.getUInt("crash_count", 0) + 1;
+    bootPrefs.putUInt("crash_count", crashCount);
+    bootPrefs.end();
+    Serial.printf("Boot-counter (sinds laatste 60s+ uptime): %u\n", (unsigned)crashCount);
+    if (crashCount >= BOOTLOOP_THRESHOLD) {
+        safeMode = true;
+        Serial.println("⚠️  SAFE-MODE — herhaalde crashes gedetecteerd");
+        setLedMode(LedMode::ERROR);
+    }
 
     // Persistente HTTPS-client zonder cert-pinning (slimhuys.nl is publieke
     // CA, een MITM op het lokale net is niet ons dreigingsmodel).
@@ -669,8 +706,9 @@ void setup() {
         delay(100);
     }
 
-    // Geen netwerk OF nog niet ge-paired? Start captive-portal voor setup.
-    if (!networkReady() || apiKey.isEmpty()) {
+    // Safe-mode: skip captive-portal en remote-init. Management-UI komt
+    // verderop wel up zodat de gebruiker factory-reset kan doen.
+    if (!safeMode && (!networkReady() || apiKey.isEmpty())) {
         Serial.println("Captive portal start (geen netwerk of geen api-key)");
         setLedMode(LedMode::PAIRING);  // blauw pulserend tot pairing klaar is
         CaptivePortal portal;
@@ -709,34 +747,63 @@ void setup() {
     // Admin-password voor management-UI (basic auth op gevaarlijke endpoints)
     String adminPass = getOrCreateAdminPassword();
 
-    // OTA-updater — periodiek check naar /v1/firmware/manifest
-    updater.begin(baseUrl, apiKey, FIRMWARE_VERSION);
+    // OTA-updater — periodiek check naar /v1/firmware/manifest. Skip in
+    // safe-mode: een kapotte firmware over OTA halen lost niks op.
+    if (!safeMode) {
+        updater.begin(baseUrl, apiKey, FIRMWARE_VERSION);
+    }
 
-    // Lokale management-interface (status + reset-knoppen + OTA)
+    // Lokale management-interface (status + reset-knoppen + OTA) — altijd
+    // up, ook in safe-mode (essentieel voor recovery via de gebruiker).
     management.begin(&prefs, FIRMWARE_VERSION, adminPass, &updater);
+    management.setSafeMode(safeMode);
     Serial.printf("Management UI: http://%s/\n",
         ethConnected ? ETH.localIP().toString().c_str() : WiFi.localIP().toString().c_str());
     Serial.printf("  ↳ login: admin / %s\n", adminPass.c_str());
 
     // Upload host+creds naar SlimHuys zodat de SPA "Toon gegevens" kan tonen.
     // Idempotent — interne check skipt als IP onveranderd is t.o.v. NVS.
-    pushManagementInfo();
+    if (!safeMode) {
+        pushManagementInfo();
+    }
 
     // P1-UART: 115200 8N1, RX-only (data komt naar ons toe).
     // Software-invert i.p.v. een NPN-inverter — moet ná begin() omdat
     // begin() de UART opnieuw configureert en de invert-flag overschrijft.
     // RX-buffer 2048B: DSMR 5.0-telegrammen kunnen ~900B groot zijn, default
     // 256B kan onder load overlopen en parses afbreken.
-    P1Serial.setRxBufferSize(2048);
-    P1Serial.begin(115200, SERIAL_8N1, P1_RX_PIN, -1);
-    uart_set_line_inverse(UART_NUM_2, UART_SIGNAL_RXD_INV);
-    reader.enable(true);
+    if (!safeMode) {
+        P1Serial.setRxBufferSize(2048);
+        P1Serial.begin(115200, SERIAL_8N1, P1_RX_PIN, -1);
+        uart_set_line_inverse(UART_NUM_2, UART_SIGNAL_RXD_INV);
+        reader.enable(true);
+    }
 
-    Serial.println("Setup klaar. P1-data verwacht…");
+    // Watchdog activeren ná setup() — captive-portal en NTP-sync kunnen
+    // tijdens setup() lang blocking zijn, wat WDT zou triggeren.
+    esp_task_wdt_init(WDT_TIMEOUT_S, true);
+    esp_task_wdt_add(NULL);
+    Serial.printf("Setup klaar (%s). %s\n",
+                  safeMode ? "SAFE-MODE" : "normaal",
+                  safeMode ? "Wachten op factory-reset via management-UI." : "P1-data verwacht…");
 }
 
 void loop() {
+    esp_task_wdt_reset();
+
+    // Bootloop-grace: 60s+ uptime = stabiel = crash_count terug naar 0.
+    // Eenmalig per boot, daarna no-op.
+    if (!bootloopGraceCleared && millis() >= BOOTLOOP_GRACE_MS) {
+        prefs.putUInt("crash_count", 0);
+        bootloopGraceCleared = true;
+        Serial.println("Bootloop-counter gereset (60s+ uptime stabiel).");
+    }
+
     management.loop();
+    if (safeMode) {
+        delay(10);
+        return;  // skip alle pushes/parses tot factory-reset
+    }
     updater.loop();
 
     // Water-push: change-driven met 1Hz throttle, plus 60s heartbeat. Geeft
@@ -828,6 +895,22 @@ void loop() {
     // LED-mode hertonen op basis van runtime-state. PAIRING wordt apart
     // gezet rond portal.run(); deze tak handelt LEAK/ERROR/OPERATIONAL.
     setLedMode(pickLedMode());
+
+    // Cyan-flash op water-pulse — alleen in OPERATIONAL want andere modes
+    // gebruiken al actief de blue/red kanalen.
+    if (waterPulseFlashRequested) {
+        waterPulseFlashRequested = false;
+        if (currentLedMode == LedMode::OPERATIONAL) {
+            ledcWrite(LEDC_CH_B, 80);   // moderate blue overlay → cyan met groen
+            waterPulseFlashUntil = now + 50;
+        }
+    }
+    if (waterPulseFlashUntil > 0 && now >= waterPulseFlashUntil) {
+        waterPulseFlashUntil = 0;
+        if (currentLedMode == LedMode::OPERATIONAL) {
+            ledcWrite(LEDC_CH_B, 0);    // terug naar pure groen
+        }
+    }
 
     // Diagnostiek: tel bytes vóór reader 'r consumeert
     int avail = P1Serial.available();
