@@ -17,6 +17,10 @@ void ManagementInterface::begin(Preferences* prefs, const String& version,
     _adminPass = adminPassword;
     _updater = updater;
     _setupRoutes();
+    // Headers die we willen kunnen lezen op _handleRoot — zonder dit returnt
+    // _server.header() altijd lege string, ongeacht wat de client stuurde.
+    static const char* kCollectHeaders[] = {"If-None-Match"};
+    _server.collectHeaders(kCollectHeaders, 1);
     _server.begin();
 }
 
@@ -82,7 +86,18 @@ void ManagementInterface::_setupRoutes() {
 }
 
 void ManagementInterface::_handleRoot() {
-    _server.sendHeader("Cache-Control", "no-store");
+    // ETag = firmware-versie. HTML verandert alleen bij firmware-update,
+    // dus de versie is een perfecte cache-key. Browser stuurt deze terug
+    // in If-None-Match → 304 zonder body, ~25KB transfer overgeslagen.
+    String etag = "\"" + _version + "\"";
+    if (_server.header("If-None-Match") == etag) {
+        _server.sendHeader("ETag", etag);
+        _server.sendHeader("Cache-Control", "public, max-age=600");
+        _server.send(304, "text/plain", "");
+        return;
+    }
+    _server.sendHeader("ETag", etag);
+    _server.sendHeader("Cache-Control", "public, max-age=600");
     _server.send_P(200, "text/html; charset=utf-8", MANAGEMENT_HTML);
 }
 
