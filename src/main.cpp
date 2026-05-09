@@ -119,6 +119,16 @@ bool leakRawState = false;
 bool leakStableState = false;
 unsigned long leakChangedAt = 0;
 
+// Lek-push state: pas POST'en als state-change verschilt van wat we de
+// backend laatst hebben verteld. NVS-persist zodat een reboot middenin
+// een leak niet opnieuw "detected"-spam veroorzaakt.
+bool lastPushedLeakState = false;
+unsigned long leakNextRetryAt = 0;
+int leakRetryAttempts = 0;
+// Exp. backoff schema voor 5xx/network: 15s, 60s, 5min, 30min cap.
+constexpr unsigned long LEAK_BACKOFF_MS[] = {15000UL, 60000UL, 300000UL, 1800000UL};
+constexpr unsigned long LEAK_4XX_COOLDOWN_MS = 1800000UL; // 30min na bridge-bug
+
 // HDC1080 omgevings-readings — 1×/30s naar management gepusht
 unsigned long lastHdcReadAt = 0;
 bool hdcPresent = false;  // gezet bij eerste succesvolle init
@@ -501,6 +511,39 @@ void pushManagementInfo() {
 }
 
 // ============================================================================
+// Push naar SlimHuys-API — lek-event (state-change only)
+// ----------------------------------------------------------------------------
+// Returnt HTTP-code, of -1 bij netwerk-/precondition-fail. Caller beslist
+// wat 'r met de code gebeurt (zie loop-handler met backoff-policy).
+// detected_at uit iso8601Now(); NTP-sync wachten zodat de alert-mail geen
+// "1970"-timestamp krijgt.
+// ============================================================================
+int pushLeakState(bool detected) {
+    if (!networkReady() || apiKey.isEmpty() || baseUrl.isEmpty()) return -1;
+    if (time(nullptr) < 1700000000) return -1;  // NTP nog niet gesynced
+
+    JsonDocument doc;
+    doc["detected"] = detected;
+    doc["sensor_id"] = "main";
+    doc["detected_at"] = iso8601Now();
+
+    String payload;
+    serializeJson(doc, payload);
+
+    HTTPClient http;
+    http.setReuse(true);
+    http.begin(secureClient, baseUrl + "/v1/me/bridges/leak");
+    http.addHeader("Authorization", "Bearer " + apiKey);
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("User-Agent", "slimhuys-p1/" FIRMWARE_VERSION);
+
+    int code = http.POST(payload);
+    http.end();
+    Serial.printf("Leak-POST (%s): HTTP %d\n", detected ? "WET" : "DRY", code);
+    return code;
+}
+
+// ============================================================================
 // Push naar SlimHuys-API — water (cumulatieve liter-stand)
 // ----------------------------------------------------------------------------
 // Aanroeper bepaalt total_l (gesnapshot vóór de call zodat ISR-races niet
@@ -560,7 +603,9 @@ void setup() {
     baseUrl = prefs.getString("base_url", SLIMHUYS_BASE_URL);
     waterPulseCount = prefs.getUInt("water_l", 0);
     lastPersistedTotal = waterPulseCount;  // start in sync met NVS
-    Serial.printf("Water-counter geladen: %u L\n", (unsigned)waterPulseCount);
+    lastPushedLeakState = prefs.getBool("leak_state", false);
+    Serial.printf("Water-counter geladen: %u L; leak-state laatst gepusht: %s\n",
+                  (unsigned)waterPulseCount, lastPushedLeakState ? "WET" : "DRY");
 
     // Flow-window pre-fillen: alle samples = current count → delta=0 →
     // flow=0 tot er echt iets stroomt. Voorkomt sprong vanuit 0 in de
@@ -728,6 +773,34 @@ void loop() {
             leakStableState = leakRawState;
             Serial.printf("Lekkage-sensor: %s\n", leakStableState ? "GEDETECTEERD" : "geen");
             management.setLeakDetected(leakStableState);
+            // State-change reset retry-state zodat een nieuwe transitie
+            // direct probeert te pushen (oude backoff-timer geannuleerd).
+            leakNextRetryAt = 0;
+            leakRetryAttempts = 0;
+        }
+    }
+
+    // Lek-push: alleen op state-change pushen. Retry-policy:
+    //  - 204/200: persist nieuwe state, klaar
+    //  - 5xx/netwerk: exp. backoff (15s, 60s, 5min, 30min cap)
+    //  - 4xx (validation/auth): cooldown 30min, geen verdere retry tot
+    //    state weer omslaat (bridge-bug, hammeren helpt niet)
+    if (leakStableState != lastPushedLeakState && now >= leakNextRetryAt) {
+        int code = pushLeakState(leakStableState);
+        if (code == 204 || code == 200) {
+            lastPushedLeakState = leakStableState;
+            prefs.putBool("leak_state", lastPushedLeakState);
+            leakRetryAttempts = 0;
+            leakNextRetryAt = 0;
+        } else if (code >= 400 && code < 500) {
+            Serial.printf("Leak-POST 4xx (%d) — geen retry, 30min cooldown\n", code);
+            leakNextRetryAt = now + LEAK_4XX_COOLDOWN_MS;
+        } else {
+            int idx = leakRetryAttempts < 4 ? leakRetryAttempts : 3;
+            leakNextRetryAt = now + LEAK_BACKOFF_MS[idx];
+            leakRetryAttempts++;
+            Serial.printf("Leak-POST retry-%d in %lums\n",
+                          leakRetryAttempts, LEAK_BACKOFF_MS[idx]);
         }
     }
 
