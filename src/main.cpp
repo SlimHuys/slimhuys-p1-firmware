@@ -87,6 +87,16 @@ constexpr unsigned long BOOTLOOP_GRACE_MS = 60000; // na 60s uptime = "succesvol
 // klantcontact. Backend throttle is 12/u, dus 5min is comfortabel binnen.
 constexpr unsigned long DIAG_PUSH_INTERVAL_MS = 5UL * 60UL * 1000UL;
 constexpr unsigned long DIAG_FIRST_PUSH_DELAY_MS = 30000; // 30s grace na boot
+
+// Management-info re-push gate. Voorheen short-circuit'te pushManagementInfo()
+// alleen op IP-equality, dus backend-state-drift (DB-restore, migration,
+// row-loss) repareerde pas bij IP-change of reboot. Nu: re-push min 1×/24h
+// sinds laatste success, plus on-demand zodra backend X-Mgmt-Refresh: 1 op
+// een 2xx-response zet. Loop check't 1×/u (functie self-gate't), elk attempt
+// throttled op max 1×/60s zodat een blijvend backend-signaal geen storm geeft.
+constexpr uint32_t MGMT_REFRESH_INTERVAL_S = 24UL * 3600UL;
+constexpr unsigned long MGMT_LOOP_CHECK_INTERVAL_MS = 60UL * 60UL * 1000UL;
+constexpr unsigned long MGMT_REFRESH_MIN_RETRY_MS = 60UL * 1000UL;
 constexpr int PUSH_INTERVAL_MS = 1000;             // P1: 1Hz
 constexpr int WATER_PUSH_THROTTLE_MS = 1000;       // Water: max 1Hz bij verandering
 constexpr int WATER_PUSH_HEARTBEAT_MS = 60000;     // Water: periodiek ook bij stilstand
@@ -175,6 +185,13 @@ unsigned long lastDiagPushAt = 0;
 bool diagFirstPushDone = false;
 uint32_t bootCount = 0;        // monotonic, niet gereset zoals crash_count
 esp_reset_reason_t bootResetReason = ESP_RST_UNKNOWN;
+
+// Management-info push-state. Push-worker (core 0) zet refreshRequested op
+// true zodra backend X-Mgmt-Refresh: 1 antwoordt; main-loop (core 1) consumeert
+// 'm. lastMgmtCheckAt tracked beide loop-triggers (periodic + refresh) zodat
+// ze één gedeelde 60s-throttle delen.
+unsigned long lastMgmtCheckAt = 0;
+volatile bool mgmtRefreshRequested = false;
 
 // Persistente TLS-client voor HTTPClient. Eén instance hergebruiken
 // betekent dat lwIP/mbedtls de TLS-sessie ID kan cachen — bij volgende
@@ -522,16 +539,28 @@ void pushReading(P1Data& d) {
 // ============================================================================
 // Push naar SlimHuys-API — management-info (LAN-IP + admin-creds)
 // ----------------------------------------------------------------------------
-// Idempotent: 1× na pairing, daarna alleen wanneer IP veranderd t.o.v.
-// laatst-uploaded waarde (DHCP-lease-rotation, kabelwissel, etc.).
 // SPA gebruikt dit om de "Toon gegevens"-knop in Mijn Huis te vullen.
+// Dubbele gate: skip alleen als IP onveranderd is t.o.v. NVS én laatste
+// success <24h geleden was. Sinds backend-state-drift (DB-restore, row-loss)
+// real is, garandeert de 24h-staleness zelf-recovery zonder reboot. Direct
+// herstel kan via X-Mgmt-Refresh-signaal in de readings-respons (zie loop()).
 // ============================================================================
 void pushManagementInfo() {
     if (!networkReady() || apiKey.isEmpty() || baseUrl.isEmpty()) return;
 
     String currentIp = ethConnected ? ETH.localIP().toString() : WiFi.localIP().toString();
     String lastIp = prefs.getString("mgmt_ip", "");
-    if (currentIp == lastIp) return;  // niets veranderd, skip de roundtrip
+
+    if (currentIp == lastIp) {
+        time_t nowEpoch = time(nullptr);
+        // Zonder NTP-sync kunnen we de leeftijd niet bepalen — vertrouw NVS
+        // en skip, anders pushen we nodeloos op elke boot vóór NTP-sync.
+        if (nowEpoch < 1700000000) return;
+        uint32_t lastTs = prefs.getUInt("mgmt_ts", 0);
+        if (lastTs != 0 && (uint32_t)nowEpoch - lastTs < MGMT_REFRESH_INTERVAL_S) {
+            return;
+        }
+    }
 
     String adminPass = prefs.getString("admin_pass", "");
     if (adminPass.isEmpty()) return;  // defensief — getOrCreateAdminPassword()
@@ -552,6 +581,10 @@ void pushManagementInfo() {
                           code, currentIp.c_str());
             if (code == 204 || code == 200) {
                 prefs.putString("mgmt_ip", currentIp);
+                time_t nowEpoch = time(nullptr);
+                if (nowEpoch >= 1700000000) {
+                    prefs.putUInt("mgmt_ts", (uint32_t)nowEpoch);
+                }
             }
         });
 }
@@ -564,6 +597,10 @@ void pushManagementInfo() {
 void pushWorkerTask(void* /*param*/) {
     esp_task_wdt_add(NULL);
     Serial.println("Push-worker gestart op core 0");
+
+    // collectHeaders() bewaart alleen pointers — daarom static const.
+    static const char* COLLECTED_HEADERS[] = {"X-Mgmt-Refresh"};
+
     for (;;) {
         esp_task_wdt_reset();
         PushJob* job = nullptr;
@@ -578,10 +615,22 @@ void pushWorkerTask(void* /*param*/) {
         http.addHeader("Authorization", "Bearer " + apiKey);
         http.addHeader("Content-Type", "application/json");
         http.addHeader("User-Agent", "slimhuys-p1/" FIRMWARE_VERSION);
+        http.collectHeaders(COLLECTED_HEADERS, 1);
 
         int code = (job->method == "PUT")
                    ? http.PUT(job->payload)
                    : http.POST(job->payload);
+
+        // Backend kan via X-Mgmt-Refresh: 1 op elke 2xx-respons signaleren
+        // dat 'ie de mgmt-creds (host/admin_pass) kwijt is. Main-loop pakt
+        // de flag op, clear't de NVS-gate en forceert pushManagementInfo().
+        if (code >= 200 && code < 300) {
+            String refresh = http.header("X-Mgmt-Refresh");
+            if (refresh == "1") {
+                mgmtRefreshRequested = true;
+            }
+        }
+
         http.end();
 
         if (job->onComplete) job->onComplete(code);
@@ -908,9 +957,11 @@ void setup() {
     Serial.printf("  ↳ login: admin / %s\n", adminPass.c_str());
 
     // Upload host+creds naar SlimHuys zodat de SPA "Toon gegevens" kan tonen.
-    // Idempotent — interne check skipt als IP onveranderd is t.o.v. NVS.
+    // Idempotent — interne check skipt als IP onveranderd is t.o.v. NVS én
+    // <24h geleden gepusht. Loop() doet de periodieke recheck.
     if (!safeMode) {
         pushManagementInfo();
+        lastMgmtCheckAt = millis();
     }
 
     // P1-UART: 115200 8N1, RX-only (data komt naar ons toe).
@@ -1029,6 +1080,25 @@ void loop() {
     } else if (diagFirstPushDone && now - lastDiagPushAt >= DIAG_PUSH_INTERVAL_MS) {
         pushDiagnostics();
         lastDiagPushAt = now;
+    }
+
+    // Management-info recheck. Twee triggers, gedeelde 60s-throttle:
+    //  • Refresh-signaal van backend (X-Mgmt-Refresh: 1) — clear NVS-gate
+    //    zodat pushManagementInfo() er gegarandeerd doorheen komt.
+    //  • Periodiek 1×/u — pushManagementInfo() self-gate't intern op
+    //    IP-equality + 24h-staleness, dus echt-pushen is zeldzaam.
+    if (now - lastMgmtCheckAt >= MGMT_REFRESH_MIN_RETRY_MS) {
+        if (mgmtRefreshRequested) {
+            mgmtRefreshRequested = false;
+            Serial.println("Backend vraagt mgmt-refresh — clear NVS-gate en re-push");
+            prefs.remove("mgmt_ip");
+            prefs.remove("mgmt_ts");
+            pushManagementInfo();
+            lastMgmtCheckAt = now;
+        } else if (now - lastMgmtCheckAt >= MGMT_LOOP_CHECK_INTERVAL_MS) {
+            pushManagementInfo();
+            lastMgmtCheckAt = now;
+        }
     }
 
     // LED-mode hertonen op basis van runtime-state. PAIRING wordt apart
