@@ -904,18 +904,22 @@ void setup() {
     // Safe-mode: skip captive-portal en remote-init. Management-UI komt
     // verderop wel up zodat de gebruiker factory-reset kan doen.
     if (!safeMode && (!networkReady() || apiKey.isEmpty())) {
+        // Ongekoppeld apparaat in portal = geen crash. Anders bouwen herhaalde
+        // portal-sessies (gebruiker komt later terug, vult code in, etc.) een
+        // crash_count op die ons na 3× in safe-mode duwt — precies omgekeerd
+        // van wat we willen tijdens onboarding.
+        if (apiKey.isEmpty()) {
+            prefs.putUInt("crash_count", 0);
+        }
         Serial.println("Captive portal start (geen netwerk of geen api-key)");
         setLedMode(LedMode::PAIRING);  // blauw pulserend tot pairing klaar is
         CaptivePortal portal;
         String claimUrl = String(SLIMHUYS_BASE_URL) + "/v1/bridges/claim";
         // Ethernet-state doorgeven zodat het portaal alleen om de pairing-code
-        // hoeft te vragen als de kabel al up is.
-        if (!portal.run("SlimHuys-Setup", claimUrl, ethConnected)) {
-            Serial.println("Portal timeout/error — reboot in 5s");
-            setLedMode(LedMode::ERROR);
-            delay(5000);
-            ESP.restart();
-        }
+        // hoeft te vragen als de kabel al up is. timeoutMs=0 → portal blijft
+        // draaien tot pairing succesvol — geen reboot-loop meer als de
+        // gebruiker pas later z'n code intikt.
+        portal.run("SlimHuys-Setup", claimUrl, ethConnected, 0);
 
         apiKey = portal.apiKey();
         baseUrl = portal.baseUrl();

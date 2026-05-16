@@ -21,12 +21,13 @@ public:
      * Start AP, host portal, blokkeer tot user klaar is of timeout verstrijkt.
      * @param ethReady  Als true: WiFi-velden verbergen; claim gaat direct over
      *                  ethernet. Als false: vraag WiFi-creds (oude flow).
+     * @param timeoutMs 0 = oneindig (portal blijft open tot pairing klaar is).
      * @return true als pairing succesvol; false bij timeout.
      */
     bool run(const char* apSsid,
              const String& claimUrl,
              bool ethReady = false,
-             unsigned long timeoutMs = 5UL * 60UL * 1000UL);
+             unsigned long timeoutMs = 0);
 
     String apiKey() const { return _apiKey; }
     String baseUrl() const { return _baseUrl; }

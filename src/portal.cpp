@@ -31,8 +31,12 @@ bool CaptivePortal::run(const char* apSsid, const String& claimUrl, bool ethRead
         _lastScanAt = millis();
     }
 
+    // timeoutMs=0 → portal blijft draaien tot pairing succesvol is. Eerste-
+    // setup heeft geen tijdsdruk; een timeout-reboot zou alleen de gebruiker
+    // wegjagen die net z'n code aan 't intikken is.
+    bool noTimeout = (timeoutMs == 0);
     unsigned long deadline = millis() + timeoutMs;
-    while (millis() < deadline) {
+    while (noTimeout || millis() < deadline) {
         _dns.processNextRequest();
         _server.handleClient();
         _processBackground();
