@@ -633,6 +633,14 @@ void pushWorkerTask(void* /*param*/) {
 
         http.end();
 
+        // Bij upstream-uitval (modem/ISP weg terwijl ETH-link up blijft) merkt
+        // secureClient niet dat de TLS-socket dood is — setReuse(true) probeert
+        // 'm dan eindeloos opnieuw te gebruiken en alle volgende pushes falen.
+        // Negatieve HTTPClient-codes = transport-fail → forceer verse handshake.
+        if (code < 0) {
+            secureClient.stop();
+        }
+
         if (job->onComplete) job->onComplete(code);
         delete job;
     }
