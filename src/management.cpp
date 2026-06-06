@@ -336,6 +336,13 @@ const char MANAGEMENT_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
   }
   h1 { font-size: 22px; margin: 0 0 4px; letter-spacing: -0.02em; }
   .subtitle { color: var(--muted); font-size: 14px; margin: 0; }
+  /* Safe-mode: bewust gedempt — informeren, niet alarmeren. */
+  .safe-banner {
+    display: none; margin: 14px 0 0; padding: 8px 12px;
+    background: #fff7ed; border: 1px solid #fed7aa; border-radius: 8px;
+    color: #9a3412; font-size: 12.5px; line-height: 1.4;
+  }
+  .safe-banner.show { display: block; }
   h2 {
     font-size: 13px;
     text-transform: uppercase;
@@ -470,6 +477,7 @@ const char MANAGEMENT_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
     <svg class="logo" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 260 56" role="img" aria-label="SlimHuys.nl"><g transform="translate(4,4)"><rect x="8" y="30" width="6" height="12" rx="1.5" fill="#B8EBD2"/><rect x="16.67" y="26" width="6" height="16" rx="1.5" fill="#4FCB8E"/><rect x="25.33" y="22" width="6" height="20" rx="1.5" fill="#22B36B"/><rect x="34" y="20" width="6" height="22" rx="1.5" fill="#0E7A47"/><path d="M 4 20 L 24 6 L 44 20" fill="none" stroke="#042E1D" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/></g><text x="64" y="37" font-family="-apple-system,'Segoe UI',system-ui,sans-serif" font-size="26" font-weight="500" letter-spacing="-0.4"><tspan fill="#042E1D">Slim</tspan><tspan fill="#0E7A47">Huys</tspan><tspan fill="#4FCB8E" font-weight="400">.nl</tspan></text></svg>
     <h1>P1-bridge</h1>
     <p class="subtitle">Status &amp; beheer</p>
+    <div class="safe-banner" id="safe-banner">Veilige modus actief — meten staat uit. Herstart de bridge om te herstellen (gebeurt anders automatisch).</div>
   </header>
 
   <h2>Live verbruik</h2>
@@ -625,6 +633,8 @@ function refresh() {
       sigEl.textContent = '–';
     }
     document.getElementById('ip').textContent = n.ip || '–';
+
+    document.getElementById('safe-banner').classList.toggle('show', !!d.safe_mode);
 
     var p = d.p1;
     var p1El = document.getElementById('p1');

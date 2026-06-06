@@ -82,6 +82,13 @@ constexpr int FLOW_WINDOW_S = 10;
 constexpr uint32_t WDT_TIMEOUT_S = 30;          // ruim boven HTTPClient TLS-handshake
 constexpr uint32_t BOOTLOOP_THRESHOLD = 3;       // 3 crashes-in-een-rij → safe-mode
 constexpr unsigned long BOOTLOOP_GRACE_MS = 60000; // na 60s uptime = "succesvol gebooten"
+// Last-resort self-recovery: een bridge die in safe-mode hangt is onbereikbaar
+// voor z'n eigenlijke taak. Na 4u in safe-mode 1× automatisch herstarten — de
+// 60s-grace heeft crash_count dan al naar 0 gezet, dus de reboot boot normaal.
+// Was 't een transiente oorzaak (brownout) → self-healed. Is 't een echte
+// fault → 3 snelle crashes brengen 'm terug in safe-mode, dus dit blijft een
+// zachte 4u-backoff i.p.v. een tight loop, met de UI-recovery-window intact.
+constexpr unsigned long SAFEMODE_AUTO_REBOOT_MS = 4UL * 3600UL * 1000UL;
 
 // Diagnostics-push: 1×/5min — vangt config-bugs en field-health zonder
 // klantcontact. Backend throttle is 12/u, dus 5min is comfortabel binnen.
@@ -812,17 +819,33 @@ void setup() {
     // Bootloop-counter ophogen vóór risky init. Wordt op 0 gezet zodra
     // we 60s succesvol draaien. 3+ in een rij = ga in safe-mode zodat
     // de gebruiker via management-UI kan factory-resetten.
+    //
+    // ALLEEN échte firmware-faults tellen als "crash". Een power-dip ("stroom
+    // even weg") geeft een BROWNOUT-/EXT-/POWERON-reset — geen bug. Marginale
+    // voeding kan tijdens boot een paar keer achter elkaar browne-outen (PHY +
+    // ETH-init trekt stroompieken); die mochten ons voorheen ten onrechte in
+    // safe-mode duwen, wat de P1-UART uitschakelt tot een handmatige herstart.
+    bool faultReset = (bootResetReason == ESP_RST_PANIC ||
+                       bootResetReason == ESP_RST_INT_WDT ||
+                       bootResetReason == ESP_RST_TASK_WDT ||
+                       bootResetReason == ESP_RST_WDT);
+
     Preferences bootPrefs;
     bootPrefs.begin("slimhuys", false);
-    uint32_t crashCount = bootPrefs.getUInt("crash_count", 0) + 1;
-    bootPrefs.putUInt("crash_count", crashCount);
+    uint32_t crashCount = bootPrefs.getUInt("crash_count", 0);
+    if (faultReset) {
+        crashCount += 1;
+        bootPrefs.putUInt("crash_count", crashCount);
+    }
     // boot_count is monotonic — telt elke boot (i.t.t. crash_count die op
     // 60s stabiele uptime gereset wordt). Naar diagnostics-push.
     bootCount = bootPrefs.getUInt("boot_count", 0) + 1;
     bootPrefs.putUInt("boot_count", bootCount);
     bootPrefs.end();
-    Serial.printf("Boot #%u (crashes-in-een-rij: %u)\n",
-                  (unsigned)bootCount, (unsigned)crashCount);
+    Serial.printf("Boot #%u (crashes-in-een-rij: %u, reset: %s%s)\n",
+                  (unsigned)bootCount, (unsigned)crashCount,
+                  resetReasonString(bootResetReason),
+                  faultReset ? " [FAULT]" : "");
     if (crashCount >= BOOTLOOP_THRESHOLD) {
         safeMode = true;
         Serial.println("⚠️  SAFE-MODE — herhaalde crashes gedetecteerd");
@@ -1010,6 +1033,13 @@ void loop() {
 
     management.loop();
     if (safeMode) {
+        // Last-resort self-recovery: na 4u stil in safe-mode 1× herstarten.
+        // crash_count is door de 60s-grace al 0, dus dit boot normaal op.
+        if (millis() >= SAFEMODE_AUTO_REBOOT_MS) {
+            Serial.println("Safe-mode >4u — automatische herstart (self-recovery)");
+            Serial.flush();
+            ESP.restart();
+        }
         delay(10);
         return;  // skip alle pushes/parses tot factory-reset
     }
