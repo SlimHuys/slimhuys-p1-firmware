@@ -221,6 +221,11 @@ struct PushJob {
 QueueHandle_t pushQueue = nullptr;
 TaskHandle_t pushTaskHandle = nullptr;
 
+// Opgeslagen WiFi-creds — nodig voor herverbinding in loop().
+String wifiSsid;
+String wifiPass;
+unsigned long lastWifiReconnectAt = 0;
+
 // In-flight gate voor leak-push: voorkomt dat een tweede leak-event
 // in de queue komt voordat de eerste callback de retry-state heeft
 // bijgewerkt (race tussen state-change en callback).
@@ -405,6 +410,13 @@ void onNetworkEvent(WiFiEvent_t event) {
             break;
         case ARDUINO_EVENT_ETH_DISCONNECTED:
             ethConnected = false;
+            break;
+        case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+            Serial.println("WiFi verbinding verloren");
+            break;
+        case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+            Serial.print("WiFi IP: ");
+            Serial.println(WiFi.localIP());
             break;
         default:
             break;
@@ -916,14 +928,15 @@ void setup() {
     // besparing weegt niet op tegen de WiFi-stabiliteit (voorkomt random
     // NOT_AUTHED-disconnects op DTIM-grenzen).
     WiFi.setSleep(false);
+    WiFi.setAutoReconnect(true);
 
     // Probeer opgeslagen WiFi-creds (parallel aan ethernet — wat 't eerst
     // up is, wordt gebruikt). Bij eerste boot zijn deze leeg → no-op.
-    String savedSsid = prefs.getString("wifi_ssid", "");
-    String savedPass = prefs.getString("wifi_pass", "");
-    if (!savedSsid.isEmpty()) {
-        Serial.printf("WiFi reconnect: %s\n", savedSsid.c_str());
-        WiFi.begin(savedSsid.c_str(), savedPass.c_str());
+    wifiSsid = prefs.getString("wifi_ssid", "");
+    wifiPass = prefs.getString("wifi_pass", "");
+    if (!wifiSsid.isEmpty()) {
+        Serial.printf("WiFi reconnect: %s\n", wifiSsid.c_str());
+        WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
     }
 
     // Ethernet starten — kabel-detectie is async via onNetworkEvent.
@@ -972,10 +985,20 @@ void setup() {
         // WiFi-creds alleen bewaren als de gebruiker ze heeft ingevuld —
         // anders zou de ethernet-flow de eventuele bestaande creds wissen.
         if (!portal.ssid().isEmpty()) {
-            prefs.putString("wifi_ssid", portal.ssid());
-            prefs.putString("wifi_pass", portal.password());
+            wifiSsid = portal.ssid();
+            wifiPass = portal.password();
+            prefs.putString("wifi_ssid", wifiSsid);
+            prefs.putString("wifi_pass", wifiPass);
         }
         Serial.println("Credentials bewaard in NVS");
+
+        // Portal draait in WIFI_AP_STA mode — terug naar STA en verbinding
+        // maken met de opgeslagen creds zodat auto-reconnect actief wordt.
+        WiFi.softAPdisconnect(true);
+        WiFi.mode(WIFI_STA);
+        if (!wifiSsid.isEmpty()) {
+            WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+        }
     }
 
     // NTP voor ISO-timestamps
@@ -1041,6 +1064,17 @@ void loop() {
         prefs.putUInt("crash_count", 0);
         bootloopGraceCleared = true;
         Serial.println("Bootloop-counter gereset (60s+ uptime stabiel).");
+    }
+
+    // WiFi-reconnect fallback: setAutoReconnect(true) handelt de meeste
+    // gevallen af, maar na een mode-switch (portal → STA) of bij een
+    // hardnekkige AP-uitval helpt een expliciete reconnect als belt-en-
+    // bretels. Throttle op 60s zodat we de AP niet overspoelen.
+    if (!wifiSsid.isEmpty() && WiFi.status() != WL_CONNECTED
+            && !ethConnected && millis() - lastWifiReconnectAt >= 60000) {
+        Serial.println("WiFi reconnect poging…");
+        WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+        lastWifiReconnectAt = millis();
     }
 
     management.loop();
