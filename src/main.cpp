@@ -856,6 +856,16 @@ void setup() {
     // CA, een MITM op het lokale net is niet ons dreigingsmodel).
     secureClient.setInsecure();
 
+    // WDT-timeout uitbreiden naar 30s vóórdat push-worker zich aanmeldt.
+    // Arduino-ESP32 pre-initialiseert de TWDT met CONFIG_ESP_TASK_WDT_TIMEOUT_S
+    // = 5s. De push-worker subscribeert via esp_task_wdt_add() en zijn
+    // queue-wait is pdMS_TO_TICKS(5000) — exact gelijk aan die 5s. Race-to-crash
+    // na precies 2 queue-cycli (~10s). esp_task_wdt_init() updatet de bestaande
+    // TWDT in-place (timeout + panic-flag) zonder subscriptions te wissen.
+    // Hoofd-taak subscribeert pas ná setup (zie verderop) zodat captive-portal
+    // onbeperkt kan lopen zonder WDT te triggeren.
+    esp_task_wdt_init(WDT_TIMEOUT_S, true);
+
     // Push-worker draait op core 0 — main-loop (core 1) blokkeert nu niet
     // meer 50-400ms per push. Initialiseren vóór de eerste enqueuePush.
     initPushWorker();
@@ -1011,9 +1021,8 @@ void setup() {
         reader.enable(true);
     }
 
-    // Watchdog activeren ná setup() — captive-portal en NTP-sync kunnen
-    // tijdens setup() lang blocking zijn, wat WDT zou triggeren.
-    esp_task_wdt_init(WDT_TIMEOUT_S, true);
+    // Hoofd-taak (loop) nu aanmelden bij WDT — ná de captive-portal zodat
+    // een lange pairing-sessie de WDT niet triggert.
     esp_task_wdt_add(NULL);
     Serial.printf("Setup klaar (%s). %s\n",
                   safeMode ? "SAFE-MODE" : "normaal",
