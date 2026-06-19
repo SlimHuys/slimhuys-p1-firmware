@@ -936,10 +936,9 @@ void setup() {
               /*type*/     ETH_PHY_LAN8720,
               /*clk_mode*/ ETH_CLOCK_GPIO17_OUT);
 
-    // 30s wachten tot ETH óf WiFi up is. 10s was te kort voor switches met
-    // STP (Spanning Tree Protocol): die houden nieuwe poorten 30-50s in
-    // blocking/learning-state voordat ze forwarden.
-    unsigned long deadline = millis() + 30000;
+    // 45s wachten tot ETH óf WiFi up is. STP (Spanning Tree Protocol) houdt
+    // nieuwe poorten 30-50s in blocking/learning-state; 45s dekt dat ruim af.
+    unsigned long deadline = millis() + 45000;
     while (millis() < deadline && !networkReady()) {
         delay(100);
     }
