@@ -936,23 +936,27 @@ void setup() {
               /*type*/     ETH_PHY_LAN8720,
               /*clk_mode*/ ETH_CLOCK_GPIO17_OUT);
 
-    // 10s wachten tot ETH óf WiFi up is
-    unsigned long deadline = millis() + 10000;
+    // 30s wachten tot ETH óf WiFi up is. 10s was te kort voor switches met
+    // STP (Spanning Tree Protocol): die houden nieuwe poorten 30-50s in
+    // blocking/learning-state voordat ze forwarden.
+    unsigned long deadline = millis() + 30000;
     while (millis() < deadline && !networkReady()) {
         delay(100);
     }
 
     // Safe-mode: skip captive-portal en remote-init. Management-UI komt
     // verderop wel up zodat de gebruiker factory-reset kan doen.
-    if (!safeMode && (!networkReady() || apiKey.isEmpty())) {
+    //
+    // Geprovisionede bridge (apiKey aanwezig) gaat NOOIT de portal in puur
+    // door trage ETH — dat zet een rogue AP op en vereist on-site herstel.
+    // Zonder apiKey is de portal noodzakelijk voor eerste pairing.
+    if (!safeMode && apiKey.isEmpty()) {
         // Ongekoppeld apparaat in portal = geen crash. Anders bouwen herhaalde
         // portal-sessies (gebruiker komt later terug, vult code in, etc.) een
         // crash_count op die ons na 3× in safe-mode duwt — precies omgekeerd
         // van wat we willen tijdens onboarding.
-        if (apiKey.isEmpty()) {
-            prefs.putUInt("crash_count", 0);
-        }
-        Serial.println("Captive portal start (geen netwerk of geen api-key)");
+        prefs.putUInt("crash_count", 0);
+        Serial.println("Captive portal start (geen api-key — eerste pairing)");
         setLedMode(LedMode::PAIRING);  // blauw pulserend tot pairing klaar is
         CaptivePortal portal;
         String claimUrl = String(SLIMHUYS_BASE_URL) + "/v1/bridges/claim";
