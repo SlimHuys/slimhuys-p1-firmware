@@ -226,6 +226,11 @@ String wifiSsid;
 String wifiPass;
 unsigned long lastWifiReconnectAt = 0;
 
+// Signaal vanuit netwerk-event naar push-worker: secureClient resetten
+// na WiFi/ETH reconnect zodat de eerste post-reconnect push meteen een
+// verse TLS-handshake doet i.p.v. 5s te wachten op de stale socket.
+volatile bool forceSecureClientReset = false;
+
 // In-flight gate voor leak-push: voorkomt dat een tweede leak-event
 // in de queue komt voordat de eerste callback de retry-state heeft
 // bijgewerkt (race tussen state-change en callback).
@@ -405,6 +410,7 @@ void onNetworkEvent(WiFiEvent_t event) {
             Serial.print("ETH IP: ");
             Serial.println(ETH.localIP());
             ethConnected = true;
+            forceSecureClientReset = true;
             // LED-mode wordt door de loop's pickLedMode() opgepakt; geen
             // directe digitalWrite hier nodig.
             break;
@@ -417,6 +423,7 @@ void onNetworkEvent(WiFiEvent_t event) {
         case ARDUINO_EVENT_WIFI_STA_GOT_IP:
             Serial.print("WiFi IP: ");
             Serial.println(WiFi.localIP());
+            forceSecureClientReset = true;
             break;
         default:
             break;
@@ -627,6 +634,13 @@ void pushWorkerTask(void* /*param*/) {
             continue;  // periodieke wakeup voor WDT-reset
         }
         if (!job) continue;
+
+        // Na WiFi/ETH reconnect is de TLS-socket stale — stop() hier zodat
+        // http.begin() meteen een verse handshake doet (geen 5s timeout).
+        if (forceSecureClientReset) {
+            forceSecureClientReset = false;
+            secureClient.stop();
+        }
 
         HTTPClient http;
         http.setReuse(true);
