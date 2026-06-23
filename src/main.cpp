@@ -948,6 +948,16 @@ void setup() {
     // Network event-listener (set ETH hostname op ETH_START)
     WiFi.onEvent(onNetworkEvent);
 
+    // Ethernet EERST starten — WiFi.begin() vóór ETH.begin() kan op ESP32
+    // de LAN8720 PHY-initialisatie breken (gedeelde RMII-registers).
+    Serial.println("ETH start…");
+    ETH.begin(/*phy_addr*/ 1,
+              /*power*/    33,
+              /*mdc*/      23,
+              /*mdio*/     18,
+              /*type*/     ETH_PHY_LAN8720,
+              /*clk_mode*/ ETH_CLOCK_GPIO17_OUT);
+
     // STA-mode initialiseren + hostname zetten — vóór WiFi.begin() (saved
     // creds én later in het portal). Hostname blijft sticky over begin/disconnect.
     WiFi.mode(WIFI_STA);
@@ -967,16 +977,6 @@ void setup() {
         Serial.printf("WiFi reconnect: %s\n", wifiSsid.c_str());
         WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
     }
-
-    // Ethernet starten — kabel-detectie is async via onNetworkEvent.
-    // Expliciete LAN8720-config (esp32dev-board kent geen ETH_PHY_*-defaults).
-    Serial.println("ETH start…");
-    ETH.begin(/*phy_addr*/ 1,
-              /*power*/    33,
-              /*mdc*/      23,
-              /*mdio*/     18,
-              /*type*/     ETH_PHY_LAN8720,
-              /*clk_mode*/ ETH_CLOCK_GPIO17_OUT);
 
     // 45s wachten tot ETH óf WiFi up is. STP (Spanning Tree Protocol) houdt
     // nieuwe poorten 30-50s in blocking/learning-state; 45s dekt dat ruim af.
