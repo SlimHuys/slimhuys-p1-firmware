@@ -166,6 +166,7 @@ OtaUpdater::Result OtaUpdater::_downloadAndFlash(const String& url, const String
     WiFiClientSecure dc;
     dc.setInsecure();
     HTTPClient http;
+    http.setTimeout(30000);  // ruim voor TLS-handshake op ESP32
     http.begin(dc, finalUrl);
     http.addHeader("User-Agent", "slimhuys-p1/" + _currentVersion);
 
@@ -197,16 +198,9 @@ OtaUpdater::Result OtaUpdater::_downloadAndFlash(const String& url, const String
     WiFiClient* stream = http.getStreamPtr();
     uint8_t buf[1024];
     size_t totalRead = 0;
-    unsigned long startedAt = millis();
+    unsigned long lastDataAt = millis();
 
     while (totalRead < (size_t)contentLen) {
-        if (!http.connected()) {
-            Serial.println("OTA: verbinding verbroken tijdens download");
-            mbedtls_sha256_free(&ctx);
-            Update.abort();
-            http.end();
-            return Result::ERROR_DOWNLOAD;
-        }
         size_t available = stream->available();
         if (available > 0) {
             size_t toRead = available > sizeof(buf) ? sizeof(buf) : available;
@@ -221,6 +215,7 @@ OtaUpdater::Result OtaUpdater::_downloadAndFlash(const String& url, const String
                 }
                 mbedtls_sha256_update(&ctx, buf, n);
                 totalRead += n;
+                lastDataAt = millis();
 
                 // Progress-log per ~10%
                 static int lastPct = -1;
@@ -232,8 +227,10 @@ OtaUpdater::Result OtaUpdater::_downloadAndFlash(const String& url, const String
             }
         } else {
             delay(1);
-            if (millis() - startedAt > 120000) {
-                Serial.println("OTA: download timeout");
+            // Timeout op basis van laatste ontvangen data, niet totale tijd —
+            // http.connected() is onbetrouwbaar bij TLS en breekt te vroeg af.
+            if (millis() - lastDataAt > 30000) {
+                Serial.println("OTA: download timeout (geen data)");
                 mbedtls_sha256_free(&ctx);
                 Update.abort();
                 http.end();
