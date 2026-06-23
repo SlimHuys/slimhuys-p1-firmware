@@ -121,6 +121,9 @@ void ManagementInterface::_handleStatus() {
     } else {
         net["type"] = "none";
     }
+    // Altijd ETH-diagnostics meesturen zodat link zonder IP zichtbaar is
+    net["eth_link"] = ETH.linkUp();
+    net["eth_ip"] = ETH.localIP().toString();
 
     JsonObject p1 = doc["p1"].to<JsonObject>();
     p1["last_parse_ok"] = _lastParseOk;
@@ -626,7 +629,10 @@ function refresh() {
       netEl.innerHTML = dot('ok') + 'Ethernet';
       sigEl.textContent = '–';
     } else if (n.type === 'wifi') {
-      netEl.innerHTML = dot('ok') + 'WiFi · ' + n.ssid;
+      var ethDiag = n.eth_link
+        ? (n.eth_ip && n.eth_ip !== '0.0.0.0' ? ' · ETH: ' + n.eth_ip : ' · ETH: link, geen IP')
+        : ' · ETH: geen link';
+      netEl.innerHTML = dot('ok') + 'WiFi · ' + n.ssid + '<span style="color:#999;font-size:.85em">' + ethDiag + '</span>';
       sigEl.textContent = n.rssi + ' dBm';
     } else {
       netEl.innerHTML = dot('err') + 'Geen verbinding';
