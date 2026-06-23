@@ -42,6 +42,7 @@
 #include <functional>
 #include <time.h>
 
+#include "diaglog.h"
 #include "management.h"
 #include "portal.h"
 #include "updater.h"
@@ -405,39 +406,38 @@ void onNetworkEvent(WiFiEvent_t event) {
             }
             break;
         case ARDUINO_EVENT_ETH_CONNECTED:
-            Serial.println("ETH cable connected");
+            diagLog("ETH: kabel verbonden");
             ethLinkUpAt = millis();
             break;
         case ARDUINO_EVENT_ETH_GOT_IP:
-            Serial.print("ETH IP: ");
-            Serial.println(ETH.localIP());
+            diagLog("ETH: IP %s", ETH.localIP().toString().c_str());
             ethConnected = true;
             forceSecureClientReset = true;
             // ETH heeft prioriteit: auto-reconnect uit + WiFi-sessie verbreken,
             // credentials bewaren zodat WiFi als fallback beschikbaar blijft.
             WiFi.setAutoReconnect(false);
             if (WiFi.status() == WL_CONNECTED) {
-                Serial.println("ETH up — WiFi-sessie verbroken (credentials bewaard)");
+                diagLog("ETH up — WiFi-sessie verbroken (credentials bewaard)");
                 WiFi.disconnect(false);
             }
             // LED-mode wordt door de loop's pickLedMode() opgepakt; geen
             // directe digitalWrite hier nodig.
             break;
         case ARDUINO_EVENT_ETH_DISCONNECTED:
+            diagLog("ETH: verbinding verloren");
             ethConnected = false;
             // ETH weg — auto-reconnect aan + WiFi als fallback starten.
             if (!wifiSsid.isEmpty()) {
-                Serial.println("ETH weg — WiFi-fallback starten…");
+                diagLog("ETH weg — WiFi-fallback starten");
                 WiFi.setAutoReconnect(true);
                 WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
             }
             break;
         case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
-            Serial.println("WiFi verbinding verloren");
+            diagLog("WiFi: verbinding verloren");
             break;
         case ARDUINO_EVENT_WIFI_STA_GOT_IP:
-            Serial.print("WiFi IP: ");
-            Serial.println(WiFi.localIP());
+            diagLog("WiFi: IP %s", WiFi.localIP().toString().c_str());
             forceSecureClientReset = true;
             break;
         default:
@@ -950,7 +950,7 @@ void setup() {
 
     // Ethernet EERST starten — WiFi.begin() vóór ETH.begin() kan op ESP32
     // de LAN8720 PHY-initialisatie breken (gedeelde RMII-registers).
-    Serial.println("ETH start…");
+    diagLog("ETH.begin() starten (phy=1 pwr=33 mdc=23 mdio=18 LAN8720 clk17out)");
     ETH.begin(/*phy_addr*/ 1,
               /*power*/    33,
               /*mdc*/      23,
@@ -974,8 +974,10 @@ void setup() {
     wifiSsid = prefs.getString("wifi_ssid", "");
     wifiPass = prefs.getString("wifi_pass", "");
     if (!wifiSsid.isEmpty()) {
-        Serial.printf("WiFi reconnect: %s\n", wifiSsid.c_str());
+        diagLog("WiFi begin: %s", wifiSsid.c_str());
         WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+    } else {
+        diagLog("WiFi: geen opgeslagen credentials");
     }
 
     // 45s wachten tot ETH óf WiFi up is. STP (Spanning Tree Protocol) houdt
@@ -984,6 +986,9 @@ void setup() {
     while (millis() < deadline && !networkReady()) {
         delay(100);
     }
+    diagLog("Netwerk na wacht: ETH_link=%d ETH_ip=%s WiFi=%d",
+            (int)ETH.linkUp(), ETH.localIP().toString().c_str(),
+            (int)(WiFi.status() == WL_CONNECTED));
 
     // Safe-mode: skip captive-portal en remote-init. Management-UI komt
     // verderop wel up zodat de gebruiker factory-reset kan doen.
@@ -1101,7 +1106,7 @@ void loop() {
     if (ETH.linkUp() && !ethConnected
             && ethLinkUpAt > 0 && millis() - ethLinkUpAt >= 30000
             && millis() - ethLinkUpAt < 30100) {
-        Serial.println("ETH: geen IP na 30s, DHCP opnieuw starten…");
+        diagLog("ETH: geen IP na 30s, DHCP opnieuw starten (link=%d)", (int)ETH.linkUp());
         ETH.config(INADDR_NONE, INADDR_NONE, INADDR_NONE);
     }
 

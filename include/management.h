@@ -73,6 +73,7 @@ private:
     void _handleOtaPost();
     void _handleOtaUpload();
     void _handleCheckUpdate();
+    void _handleLog();
 
     WebServer _server{80};
     Preferences* _prefs = nullptr;

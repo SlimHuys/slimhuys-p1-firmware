@@ -5,6 +5,8 @@
 #include <Update.h>
 #include <WiFi.h>
 
+#include "diaglog.h"
+
 // Diagnostiek-counter uit main.cpp — telt bytes op P1-UART
 extern uint32_t p1BytesObserved;
 
@@ -82,6 +84,7 @@ void ManagementInterface::_setupRoutes() {
                [this]() { _handleOtaPost(); },
                [this]() { _handleOtaUpload(); });
     _server.on("/api/check-update", HTTP_POST, [this]() { _handleCheckUpdate(); });
+    _server.on("/api/log", HTTP_GET, [this]() { _handleLog(); });
     _server.onNotFound([this]() { _server.send(404, "text/plain", "not found"); });
 }
 
@@ -195,6 +198,11 @@ void ManagementInterface::_handleStatus() {
     serializeJson(doc, body);
     _server.sendHeader("Cache-Control", "no-store");
     _server.send(200, "application/json", body);
+}
+
+void ManagementInterface::_handleLog() {
+    _server.sendHeader("Cache-Control", "no-cache");
+    _server.send(200, "text/plain; charset=utf-8", getDiagLog());
 }
 
 void ManagementInterface::_handleReboot() {
