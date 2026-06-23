@@ -6,8 +6,9 @@
 #include <esp_ota_ops.h>
 #include <mbedtls/sha256.h>
 
-constexpr unsigned long CHECK_INTERVAL_MS = 24UL * 3600UL * 1000UL;  // 24u
-constexpr unsigned long FIRST_CHECK_DELAY_MS = 60UL * 1000UL;         // 60s na boot
+constexpr unsigned long CHECK_INTERVAL_MS       = 24UL * 3600UL * 1000UL;  // 24u na succes
+constexpr unsigned long CHECK_RETRY_INTERVAL_MS =        5UL * 60UL * 1000UL;  // 5min na fout
+constexpr unsigned long FIRST_CHECK_DELAY_MS    =              60UL * 1000UL;   // 60s na boot
 
 static long parseVersion(const String& v) {
     // "1.23.4" → 1*1e6 + 23*1e3 + 4 = 1023004 — voor simpele < / > vergelijking
@@ -46,16 +47,23 @@ void OtaUpdater::loop() {
         return;
     }
 
-    // Daarna elke 24u
-    if (now - _lastCheckAt > CHECK_INTERVAL_MS) {
+    // Na succes: elke 24u. Na een fout: retry na 5min.
+    bool isError = (_lastResult != Result::UP_TO_DATE &&
+                    _lastResult != Result::UPDATED_REBOOTING);
+    unsigned long interval = isError ? CHECK_RETRY_INTERVAL_MS : CHECK_INTERVAL_MS;
+    if (now - _lastCheckAt > interval) {
         checkNow();
     }
 }
 
 OtaUpdater::Result OtaUpdater::checkNow() {
-    _lastCheckAt = millis();
+    // _lastCheckAt pas zetten na een succesvolle check zodat een fout
+    // na CHECK_RETRY_INTERVAL_MS (5min) opnieuw geprobeerd wordt i.p.v.
+    // 24u te wachten.
+    unsigned long checkStarted = millis();
 
     if (_baseUrl.isEmpty() || _apiKey.isEmpty()) {
+        _lastCheckAt = checkStarted;
         _lastResult = Result::ERROR_NETWORK;
         return _lastResult;
     }
@@ -75,6 +83,7 @@ OtaUpdater::Result OtaUpdater::checkNow() {
         _availableNotes = "";
         http.end();
         Serial.println("OTA: geen update beschikbaar");
+        _lastCheckAt = checkStarted;
         _lastResult = Result::UP_TO_DATE;
         return _lastResult;
     }
@@ -82,6 +91,7 @@ OtaUpdater::Result OtaUpdater::checkNow() {
     if (status != 200) {
         Serial.printf("OTA manifest faalde: HTTP %d\n", status);
         http.end();
+        // Geen _lastCheckAt update — loop() retried na CHECK_RETRY_INTERVAL_MS
         _lastResult = Result::ERROR_NETWORK;
         return _lastResult;
     }
@@ -93,7 +103,7 @@ OtaUpdater::Result OtaUpdater::checkNow() {
     if (deserializeJson(doc, body)) {
         Serial.println("OTA: manifest parse-fout");
         _lastResult = Result::ERROR_MANIFEST;
-        return _lastResult;
+        return _lastResult;  // geen _lastCheckAt → retry na 5min
     }
 
     String targetVersion = doc["version"].as<String>();
@@ -106,7 +116,7 @@ OtaUpdater::Result OtaUpdater::checkNow() {
     if (targetVersion.isEmpty() || url.isEmpty() || sha256.isEmpty()) {
         Serial.println("OTA: manifest mist verplichte velden");
         _lastResult = Result::ERROR_MANIFEST;
-        return _lastResult;
+        return _lastResult;  // geen _lastCheckAt → retry na 5min
     }
 
     long current = parseVersion(_currentVersion);
@@ -114,6 +124,7 @@ OtaUpdater::Result OtaUpdater::checkNow() {
     if (target <= current) {
         Serial.printf("OTA: huidige versie %s is up-to-date (target %s)\n",
             _currentVersion.c_str(), targetVersion.c_str());
+        _lastCheckAt = checkStarted;
         _lastResult = Result::UP_TO_DATE;
         return _lastResult;
     }
@@ -121,6 +132,7 @@ OtaUpdater::Result OtaUpdater::checkNow() {
     Serial.printf("OTA: update beschikbaar %s → %s (channel %s)\n",
         _currentVersion.c_str(), targetVersion.c_str(), _channel.c_str());
 
+    _lastCheckAt = checkStarted;  // telt als succesvolle check; download-fout → 5min retry
     _lastResult = _downloadAndFlash(url, sha256);
     return _lastResult;
 }
