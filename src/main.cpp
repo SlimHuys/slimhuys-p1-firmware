@@ -129,6 +129,8 @@ String baseUrl;
 String deviceHostname;
 volatile bool ethConnected = false;
 unsigned long ethLinkUpAt = 0;   // tijdstip waarop ETH-kabel verbonden werd
+volatile bool ethDhcpRefreshNeeded = false;  // vlag: loop moet DHCP herstarten
+bool ethDhcpRetried = false;                 // éénmalige 30s-retry al gedaan?
 unsigned long lastPushAt = 0;
 unsigned long lastWaterPushAt = 0;
 unsigned long lastWaterPersistAt = 0;
@@ -409,6 +411,8 @@ void onNetworkEvent(WiFiEvent_t event) {
         case ARDUINO_EVENT_ETH_CONNECTED:
             diagLog("ETH: kabel verbonden");
             ethLinkUpAt = millis();
+            ethDhcpRetried = false;
+            ethDhcpRefreshNeeded = true;  // loop triggert DHCP-refresh
             break;
         case ARDUINO_EVENT_ETH_GOT_IP:
             diagLog("ETH: IP %s", ETH.localIP().toString().c_str());
@@ -427,6 +431,7 @@ void onNetworkEvent(WiFiEvent_t event) {
         case ARDUINO_EVENT_ETH_DISCONNECTED:
             diagLog("ETH: verbinding verloren");
             ethConnected = false;
+            ethDhcpRetried = false;
             // ETH weg — auto-reconnect aan + WiFi als fallback starten.
             if (!wifiSsid.isEmpty()) {
                 diagLog("ETH weg — WiFi-fallback starten");
@@ -1109,13 +1114,17 @@ void loop() {
         Serial.println("Bootloop-counter gereset (60s+ uptime stabiel).");
     }
 
-    // ETH-DHCP-retry: als ETH link up is maar na 30s nog geen IP, herstart
-    // DHCP expliciet. Niet in de event-handler doen — dat interfereert met
-    // de automatische DHCP die al loopt zodra de link omhoog komt.
-    if (ETH.linkUp() && !ethConnected
-            && ethLinkUpAt > 0 && millis() - ethLinkUpAt >= 30000
-            && millis() - ethLinkUpAt < 30100) {
-        diagLog("ETH: geen IP na 30s, DHCP opnieuw starten (link=%d)", (int)ETH.linkUp());
+    // ETH-DHCP-refresh: direct na ETH_CONNECTED (via vlag) en éénmalige
+    // retry na 30s. Niet in de event-handler — interfereert met auto-DHCP.
+    if (ethDhcpRefreshNeeded && ETH.linkUp() && !ethConnected) {
+        ethDhcpRefreshNeeded = false;
+        diagLog("ETH: DHCP-refresh (direct na link-up)");
+        ETH.config(INADDR_NONE, INADDR_NONE, INADDR_NONE);
+    }
+    if (!ethDhcpRetried && ETH.linkUp() && !ethConnected
+            && ethLinkUpAt > 0 && millis() - ethLinkUpAt >= 30000) {
+        ethDhcpRetried = true;
+        diagLog("ETH: geen IP na 30s, DHCP retry (link=%d)", (int)ETH.linkUp());
         ETH.config(INADDR_NONE, INADDR_NONE, INADDR_NONE);
     }
 
