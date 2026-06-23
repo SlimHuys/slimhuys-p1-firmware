@@ -400,6 +400,7 @@ void onNetworkEvent(WiFiEvent_t event) {
             }
             break;
         case ARDUINO_EVENT_ETH_START:
+            diagLog("ETH: driver gestart");
             // Idem voor ETH — móet vóór DHCP, anders "espressif".
             if (!deviceHostname.isEmpty()) {
                 ETH.setHostname(deviceHostname.c_str());
@@ -950,6 +951,13 @@ void setup() {
 
     // Ethernet EERST starten — WiFi.begin() vóór ETH.begin() kan op ESP32
     // de LAN8720 PHY-initialisatie breken (gedeelde RMII-registers).
+    // Expliciete power-cycle vóór ETH.begin(): LAN8720 NRST laag houden
+    // (250ms > Arduino-library standaard 150ms) zodat de PHY zeker reset.
+    pinMode(33, OUTPUT);
+    digitalWrite(33, LOW);
+    delay(250);
+    digitalWrite(33, HIGH);
+    delay(250);
     diagLog("ETH.begin() starten (phy=1 pwr=33 mdc=23 mdio=18 LAN8720 clk17out)");
     ETH.begin(/*phy_addr*/ 1,
               /*power*/    33,
