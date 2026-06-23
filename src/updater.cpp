@@ -140,6 +140,7 @@ OtaUpdater::Result OtaUpdater::checkNow() {
 OtaUpdater::Result OtaUpdater::_downloadAndFlash(const String& url, const String& expectedSha) {
     HTTPClient http;
     http.begin(url);
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
     http.addHeader("User-Agent", "slimhuys-p1/" + _currentVersion);
 
     int status = http.GET();
