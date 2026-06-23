@@ -124,6 +124,8 @@ OtaUpdater::Result OtaUpdater::checkNow() {
     if (target <= current) {
         Serial.printf("OTA: huidige versie %s is up-to-date (target %s)\n",
             _currentVersion.c_str(), targetVersion.c_str());
+        _availableVersion = "";
+        _availableNotes = "";
         _lastCheckAt = checkStarted;
         _lastResult = Result::UP_TO_DATE;
         return _lastResult;
