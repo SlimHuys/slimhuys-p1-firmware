@@ -140,9 +140,33 @@ OtaUpdater::Result OtaUpdater::checkNow() {
 }
 
 OtaUpdater::Result OtaUpdater::_downloadAndFlash(const String& url, const String& expectedSha) {
+    // GitHub Releases stuurt een 302 naar objects.githubusercontent.com.
+    // HTTPC_FORCE_FOLLOW_REDIRECTS hergebruikt de TLS-sessie van het eerste
+    // domein, wat mislukt. Oplossing: redirect handmatig in één losse request
+    // resolven, daarna een verse verbinding naar de uiteindelijke URL.
+    String finalUrl = url;
+    {
+        WiFiClientSecure rc;
+        rc.setInsecure();
+        HTTPClient hr;
+        hr.begin(rc, url);
+        hr.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+        hr.addHeader("User-Agent", "slimhuys-p1/" + _currentVersion);
+        int s = hr.GET();
+        if (s == 301 || s == 302 || s == 303 || s == 307 || s == 308) {
+            String loc = hr.getLocation();
+            if (!loc.isEmpty()) {
+                finalUrl = loc;
+                Serial.printf("OTA: redirect → %s\n", finalUrl.c_str());
+            }
+        }
+        hr.end();
+    }
+
+    WiFiClientSecure dc;
+    dc.setInsecure();
     HTTPClient http;
-    http.begin(url);
-    http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+    http.begin(dc, finalUrl);
     http.addHeader("User-Agent", "slimhuys-p1/" + _currentVersion);
 
     int status = http.GET();
