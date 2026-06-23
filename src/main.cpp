@@ -959,12 +959,13 @@ void setup() {
     digitalWrite(33, HIGH);
     delay(250);
     diagLog("ETH.begin() starten (phy=1 pwr=33 mdc=23 mdio=18 LAN8720 clk17out)");
-    ETH.begin(/*phy_addr*/ 1,
-              /*power*/    33,
+    bool ethOk = ETH.begin(/*phy_addr*/ 1,
+              /*power*/    -1,   // power al handmatig gedaan hierboven
               /*mdc*/      23,
               /*mdio*/     18,
               /*type*/     ETH_PHY_LAN8720,
               /*clk_mode*/ ETH_CLOCK_GPIO17_OUT);
+    diagLog("ETH.begin() return: %s", ethOk ? "true" : "false");
 
     // STA-mode initialiseren + hostname zetten — vóór WiFi.begin() (saved
     // creds én later in het portal). Hostname blijft sticky over begin/disconnect.
@@ -1116,6 +1117,13 @@ void loop() {
             && millis() - ethLinkUpAt < 30100) {
         diagLog("ETH: geen IP na 30s, DHCP opnieuw starten (link=%d)", (int)ETH.linkUp());
         ETH.config(INADDR_NONE, INADDR_NONE, INADDR_NONE);
+    }
+
+    // Eerste 60s: elke 5s ETH-linkstatus loggen voor diagnose.
+    static unsigned long lastEthLog = 0;
+    if (!ethConnected && millis() < 60000 && millis() - lastEthLog >= 5000) {
+        lastEthLog = millis();
+        diagLog("ETH poll: link=%d speed=%d", (int)ETH.linkUp(), (int)ETH.linkSpeed());
     }
 
     // WiFi-reconnect fallback: setAutoReconnect(true) handelt de meeste
