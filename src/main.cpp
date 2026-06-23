@@ -127,6 +127,7 @@ String apiKey;
 String baseUrl;
 String deviceHostname;
 volatile bool ethConnected = false;
+unsigned long ethLinkUpAt = 0;   // tijdstip waarop ETH-kabel verbonden werd
 unsigned long lastPushAt = 0;
 unsigned long lastWaterPushAt = 0;
 unsigned long lastWaterPersistAt = 0;
@@ -405,10 +406,7 @@ void onNetworkEvent(WiFiEvent_t event) {
             break;
         case ARDUINO_EVENT_ETH_CONNECTED:
             Serial.println("ETH cable connected");
-            // Forceer DHCP-heronderhandeling na (her)verbinding — zonder dit
-            // krijgt de DHCP-client na een disconnect/reconnect soms geen nieuw
-            // lease omdat lwIP de oude state vasthoudt.
-            ETH.config(INADDR_NONE, INADDR_NONE, INADDR_NONE);
+            ethLinkUpAt = millis();
             break;
         case ARDUINO_EVENT_ETH_GOT_IP:
             Serial.print("ETH IP: ");
@@ -1082,6 +1080,16 @@ void loop() {
         prefs.putUInt("crash_count", 0);
         bootloopGraceCleared = true;
         Serial.println("Bootloop-counter gereset (60s+ uptime stabiel).");
+    }
+
+    // ETH-DHCP-retry: als ETH link up is maar na 30s nog geen IP, herstart
+    // DHCP expliciet. Niet in de event-handler doen — dat interfereert met
+    // de automatische DHCP die al loopt zodra de link omhoog komt.
+    if (ETH.linkUp() && !ethConnected
+            && ethLinkUpAt > 0 && millis() - ethLinkUpAt >= 30000
+            && millis() - ethLinkUpAt < 30100) {
+        Serial.println("ETH: geen IP na 30s, DHCP opnieuw starten…");
+        ETH.config(INADDR_NONE, INADDR_NONE, INADDR_NONE);
     }
 
     // WiFi-reconnect fallback: setAutoReconnect(true) handelt de meeste
