@@ -413,8 +413,9 @@ void onNetworkEvent(WiFiEvent_t event) {
             Serial.println(ETH.localIP());
             ethConnected = true;
             forceSecureClientReset = true;
-            // ETH heeft prioriteit: WiFi-sessie verbreken maar credentials
-            // bewaren zodat WiFi als fallback beschikbaar blijft.
+            // ETH heeft prioriteit: auto-reconnect uit + WiFi-sessie verbreken,
+            // credentials bewaren zodat WiFi als fallback beschikbaar blijft.
+            WiFi.setAutoReconnect(false);
             if (WiFi.status() == WL_CONNECTED) {
                 Serial.println("ETH up — WiFi-sessie verbroken (credentials bewaard)");
                 WiFi.disconnect(false);
@@ -424,9 +425,10 @@ void onNetworkEvent(WiFiEvent_t event) {
             break;
         case ARDUINO_EVENT_ETH_DISCONNECTED:
             ethConnected = false;
-            // ETH weg — WiFi als fallback starten als credentials bekend zijn.
+            // ETH weg — auto-reconnect aan + WiFi als fallback starten.
             if (!wifiSsid.isEmpty()) {
                 Serial.println("ETH weg — WiFi-fallback starten…");
+                WiFi.setAutoReconnect(true);
                 WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
             }
             break;
