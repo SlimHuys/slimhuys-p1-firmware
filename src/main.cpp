@@ -405,6 +405,10 @@ void onNetworkEvent(WiFiEvent_t event) {
             break;
         case ARDUINO_EVENT_ETH_CONNECTED:
             Serial.println("ETH cable connected");
+            // Forceer DHCP-heronderhandeling na (her)verbinding — zonder dit
+            // krijgt de DHCP-client na een disconnect/reconnect soms geen nieuw
+            // lease omdat lwIP de oude state vasthoudt.
+            ETH.config(INADDR_NONE, INADDR_NONE, INADDR_NONE);
             break;
         case ARDUINO_EVENT_ETH_GOT_IP:
             Serial.print("ETH IP: ");

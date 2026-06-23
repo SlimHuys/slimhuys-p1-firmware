@@ -108,7 +108,7 @@ void ManagementInterface::_handleStatus() {
     doc["heap_free"] = ESP.getFreeHeap();
 
     JsonObject net = doc["network"].to<JsonObject>();
-    if (ETH.linkUp()) {
+    if (ETH.linkUp() && ETH.localIP() != IPAddress(0, 0, 0, 0)) {
         net["type"] = "ethernet";
         net["ip"] = ETH.localIP().toString();
         net["mac"] = ETH.macAddress();
