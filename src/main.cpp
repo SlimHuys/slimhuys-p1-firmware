@@ -128,9 +128,11 @@ String apiKey;
 String baseUrl;
 String deviceHostname;
 volatile bool ethConnected = false;
-unsigned long ethLinkUpAt = 0;   // tijdstip waarop ETH-kabel verbonden werd
+unsigned long ethLinkUpAt = 0;      // tijdstip waarop ETH-kabel verbonden werd
+unsigned long ethDriverStartedAt = 0; // tijdstip waarop ETH-driver gestart is
 volatile bool ethDhcpRefreshNeeded = false;  // vlag: loop moet DHCP herstarten
 bool ethDhcpRetried = false;                 // éénmalige 30s-retry al gedaan?
+bool ethPhyRetried = false;                  // éénmalige PHY-herstart al gedaan?
 unsigned long lastPushAt = 0;
 unsigned long lastWaterPushAt = 0;
 unsigned long lastWaterPersistAt = 0;
@@ -391,6 +393,22 @@ P1Reader reader(&P1Serial, P1_REQUEST_PIN);
 // ============================================================================
 // Helpers
 // ============================================================================
+
+void ethPhyInit() {
+    // Power-cycle LAN8720 NRST (GPIO33): 500ms laag, 500ms hoog.
+    // Library-reset overgeslagen (power=-1) omdat we het handmatig doen.
+    pinMode(33, OUTPUT);
+    digitalWrite(33, LOW);
+    delay(500);
+    digitalWrite(33, HIGH);
+    delay(500);
+    diagLog("ETH.begin() (phy=1 pwr=33 mdc=23 mdio=18 LAN8720 clk17out)");
+    bool ok = ETH.begin(/*phy_addr*/ 1, /*power*/ -1,
+                        /*mdc*/ 23, /*mdio*/ 18,
+                        ETH_PHY_LAN8720, ETH_CLOCK_GPIO17_OUT);
+    diagLog("ETH.begin() return: %s", ok ? "true" : "false");
+}
+
 void onNetworkEvent(WiFiEvent_t event) {
     switch (event) {
         case ARDUINO_EVENT_WIFI_STA_START:
@@ -403,7 +421,8 @@ void onNetworkEvent(WiFiEvent_t event) {
             break;
         case ARDUINO_EVENT_ETH_START:
             diagLog("ETH: driver gestart");
-            // Idem voor ETH — móet vóór DHCP, anders "espressif".
+            ethDriverStartedAt = millis();
+            ethPhyRetried = false;
             if (!deviceHostname.isEmpty()) {
                 ETH.setHostname(deviceHostname.c_str());
             }
@@ -956,25 +975,7 @@ void setup() {
 
     // Ethernet EERST starten — WiFi.begin() vóór ETH.begin() kan op ESP32
     // de LAN8720 PHY-initialisatie breken (gedeelde RMII-registers).
-    // Expliciete power-cycle: LAN8720 NRST 500ms laag, dan 500ms hoog
-    // voor stabiele settle-tijd. Library-reset overgeslagen (power=-1).
-    auto ethBegin = [&]() {
-        pinMode(33, OUTPUT);
-        digitalWrite(33, LOW);
-        delay(500);
-        digitalWrite(33, HIGH);
-        delay(500);
-        diagLog("ETH.begin() (phy=1 pwr=33 mdc=23 mdio=18 LAN8720 clk17out)");
-        bool ok = ETH.begin(/*phy_addr*/ 1,
-                  /*power*/    -1,
-                  /*mdc*/      23,
-                  /*mdio*/     18,
-                  /*type*/     ETH_PHY_LAN8720,
-                  /*clk_mode*/ ETH_CLOCK_GPIO17_OUT);
-        diagLog("ETH.begin() return: %s", ok ? "true" : "false");
-        return ok;
-    };
-    ethBegin();
+    ethPhyInit();
 
     // STA-mode initialiseren + hostname zetten — vóór WiFi.begin() (saved
     // creds én later in het portal). Hostname blijft sticky over begin/disconnect.
@@ -1000,16 +1001,9 @@ void setup() {
 
     // 45s wachten tot ETH óf WiFi up is. STP (Spanning Tree Protocol) houdt
     // nieuwe poorten 30-50s in blocking/learning-state; 45s dekt dat ruim af.
-    // Als ETH na 10s nog geen link heeft, éénmalige herstart van de PHY.
     unsigned long deadline = millis() + 45000;
-    bool ethRetried = false;
     while (millis() < deadline && !networkReady()) {
         delay(100);
-        if (!ethRetried && !ETH.linkUp() && millis() > 10000) {
-            ethRetried = true;
-            diagLog("ETH: geen link na 10s — PHY herstart");
-            ethBegin();
-        }
     }
     diagLog("Netwerk na wacht: ETH_link=%d ETH_ip=%s WiFi=%d",
             (int)ETH.linkUp(), ETH.localIP().toString().c_str(),
@@ -1123,6 +1117,15 @@ void loop() {
         prefs.putUInt("crash_count", 0);
         bootloopGraceCleared = true;
         Serial.println("Bootloop-counter gereset (60s+ uptime stabiel).");
+    }
+
+    // ETH PHY-herstart: als de driver gestart is maar na 15s nog geen link,
+    // éénmalige power-cycle + ETH.begin() retry als achtergrondproces.
+    if (!ethPhyRetried && ethDriverStartedAt > 0
+            && !ETH.linkUp() && millis() - ethDriverStartedAt >= 15000) {
+        ethPhyRetried = true;
+        diagLog("ETH: geen link na 15s — PHY herstart");
+        ethPhyInit();
     }
 
     // ETH-DHCP-refresh: direct na ETH_CONNECTED (via vlag) en éénmalige
