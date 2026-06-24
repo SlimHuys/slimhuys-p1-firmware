@@ -956,21 +956,25 @@ void setup() {
 
     // Ethernet EERST starten — WiFi.begin() vóór ETH.begin() kan op ESP32
     // de LAN8720 PHY-initialisatie breken (gedeelde RMII-registers).
-    // Expliciete power-cycle vóór ETH.begin(): LAN8720 NRST laag houden
-    // (250ms > Arduino-library standaard 150ms) zodat de PHY zeker reset.
-    pinMode(33, OUTPUT);
-    digitalWrite(33, LOW);
-    delay(250);
-    digitalWrite(33, HIGH);
-    delay(250);
-    diagLog("ETH.begin() starten (phy=1 pwr=33 mdc=23 mdio=18 LAN8720 clk17out)");
-    bool ethOk = ETH.begin(/*phy_addr*/ 1,
-              /*power*/    -1,   // power al handmatig gedaan hierboven
-              /*mdc*/      23,
-              /*mdio*/     18,
-              /*type*/     ETH_PHY_LAN8720,
-              /*clk_mode*/ ETH_CLOCK_GPIO17_OUT);
-    diagLog("ETH.begin() return: %s", ethOk ? "true" : "false");
+    // Expliciete power-cycle: LAN8720 NRST 500ms laag, dan 500ms hoog
+    // voor stabiele settle-tijd. Library-reset overgeslagen (power=-1).
+    auto ethBegin = [&]() {
+        pinMode(33, OUTPUT);
+        digitalWrite(33, LOW);
+        delay(500);
+        digitalWrite(33, HIGH);
+        delay(500);
+        diagLog("ETH.begin() (phy=1 pwr=33 mdc=23 mdio=18 LAN8720 clk17out)");
+        bool ok = ETH.begin(/*phy_addr*/ 1,
+                  /*power*/    -1,
+                  /*mdc*/      23,
+                  /*mdio*/     18,
+                  /*type*/     ETH_PHY_LAN8720,
+                  /*clk_mode*/ ETH_CLOCK_GPIO17_OUT);
+        diagLog("ETH.begin() return: %s", ok ? "true" : "false");
+        return ok;
+    };
+    ethBegin();
 
     // STA-mode initialiseren + hostname zetten — vóór WiFi.begin() (saved
     // creds én later in het portal). Hostname blijft sticky over begin/disconnect.
@@ -996,9 +1000,16 @@ void setup() {
 
     // 45s wachten tot ETH óf WiFi up is. STP (Spanning Tree Protocol) houdt
     // nieuwe poorten 30-50s in blocking/learning-state; 45s dekt dat ruim af.
+    // Als ETH na 10s nog geen link heeft, éénmalige herstart van de PHY.
     unsigned long deadline = millis() + 45000;
+    bool ethRetried = false;
     while (millis() < deadline && !networkReady()) {
         delay(100);
+        if (!ethRetried && !ETH.linkUp() && millis() > 10000) {
+            ethRetried = true;
+            diagLog("ETH: geen link na 10s — PHY herstart");
+            ethBegin();
+        }
     }
     diagLog("Netwerk na wacht: ETH_link=%d ETH_ip=%s WiFi=%d",
             (int)ETH.linkUp(), ETH.localIP().toString().c_str(),
