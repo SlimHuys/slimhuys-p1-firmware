@@ -1119,13 +1119,17 @@ void loop() {
         Serial.println("Bootloop-counter gereset (60s+ uptime stabiel).");
     }
 
-    // ETH PHY-herstart: als de driver gestart is maar na 15s nog geen link,
-    // éénmalige power-cycle + ETH.begin() retry als achtergrondproces.
+    // ETH PHY power-cycle: als de driver draait maar na 15s nog geen link,
+    // alleen GPIO33 LOW/HIGH — ETH.begin() NIET opnieuw (driver draait al,
+    // tweede aanroep geeft false). Driver detecteert link via MDIO-polling.
     if (!ethPhyRetried && ethDriverStartedAt > 0
             && !ETH.linkUp() && millis() - ethDriverStartedAt >= 15000) {
         ethPhyRetried = true;
-        diagLog("ETH: geen link na 15s — PHY herstart");
-        ethPhyInit();
+        diagLog("ETH: geen link na 15s — PHY power-cycle (driver blijft draaien)");
+        pinMode(33, OUTPUT);
+        digitalWrite(33, LOW);
+        delay(500);
+        digitalWrite(33, HIGH);
     }
 
     // ETH-DHCP-refresh: direct na ETH_CONNECTED (via vlag) en éénmalige
