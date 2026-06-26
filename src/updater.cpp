@@ -7,6 +7,8 @@
 #include <esp_ota_ops.h>
 #include <mbedtls/sha256.h>
 
+#include "diaglog.h"
+
 constexpr unsigned long CHECK_INTERVAL_MS       = 24UL * 3600UL * 1000UL;  // 24u na succes
 constexpr unsigned long CHECK_RETRY_INTERVAL_MS =        5UL * 60UL * 1000UL;  // 5min na fout
 constexpr unsigned long FIRST_CHECK_DELAY_MS    =              60UL * 1000UL;   // 60s na boot
@@ -93,7 +95,7 @@ OtaUpdater::Result OtaUpdater::checkNow() {
     }
 
     if (status != 200) {
-        Serial.printf("OTA manifest faalde: HTTP %d\n", status);
+        diagLog("OTA manifest faalde: HTTP %d", status);
         http.end();
         // Geen _lastCheckAt update — loop() retried na CHECK_RETRY_INTERVAL_MS
         _lastResult = Result::ERROR_NETWORK;
@@ -105,7 +107,7 @@ OtaUpdater::Result OtaUpdater::checkNow() {
 
     JsonDocument doc;
     if (deserializeJson(doc, body)) {
-        Serial.println("OTA: manifest parse-fout");
+        diagLog("OTA: manifest parse-fout");
         _lastResult = Result::ERROR_MANIFEST;
         return _lastResult;  // geen _lastCheckAt → retry na 5min
     }
@@ -118,7 +120,7 @@ OtaUpdater::Result OtaUpdater::checkNow() {
     _channel = doc["channel"].as<String>();
 
     if (targetVersion.isEmpty() || url.isEmpty() || sha256.isEmpty()) {
-        Serial.println("OTA: manifest mist verplichte velden");
+        diagLog("OTA: manifest mist verplichte velden");
         _lastResult = Result::ERROR_MANIFEST;
         return _lastResult;  // geen _lastCheckAt → retry na 5min
     }
@@ -144,52 +146,35 @@ OtaUpdater::Result OtaUpdater::checkNow() {
 }
 
 OtaUpdater::Result OtaUpdater::_downloadAndFlash(const String& url, const String& expectedSha) {
-    // GitHub Releases stuurt een 302 naar objects.githubusercontent.com.
-    // HTTPC_FORCE_FOLLOW_REDIRECTS hergebruikt de TLS-sessie van het eerste
-    // domein, wat mislukt. Oplossing: redirect handmatig in één losse request
-    // resolven, daarna een verse verbinding naar de uiteindelijke URL.
-    String finalUrl = url;
-    {
-        WiFiClientSecure rc;
-        rc.setInsecure();
-        HTTPClient hr;
-        hr.begin(rc, url);
-        hr.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
-        hr.addHeader("User-Agent", "slimhuys-p1/" + _currentVersion);
-        int s = hr.GET();
-        if (s == 301 || s == 302 || s == 303 || s == 307 || s == 308) {
-            String loc = hr.getLocation();
-            if (!loc.isEmpty()) {
-                finalUrl = loc;
-                Serial.printf("OTA: redirect → %s\n", finalUrl.c_str());
-            }
-        }
-        hr.end();
-    }
-
+    // GitHub Releases stuurt een 302 naar release-assets.githubusercontent.com.
+    // HTTPC_FORCE_FOLLOW_REDIRECTS opent per hop een nieuwe verbinding —
+    // geen TLS-sessie hergebruik — en werkt correct cross-domain.
     WiFiClientSecure dc;
     dc.setInsecure();
     HTTPClient http;
-    http.setTimeout(30000);  // ruim voor TLS-handshake op ESP32
-    http.begin(dc, finalUrl);
+    http.setTimeout(30000);
+    http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+    http.begin(dc, url);
     http.addHeader("User-Agent", "slimhuys-p1/" + _currentVersion);
 
     int status = http.GET();
     if (status != 200) {
-        Serial.printf("OTA download faalde: HTTP %d\n", status);
+        diagLog("OTA download faalde: HTTP %d", status);
         http.end();
         return Result::ERROR_DOWNLOAD;
     }
 
     int contentLen = http.getSize();
     if (contentLen <= 0) {
-        Serial.println("OTA: geen Content-Length, kan niet flashen");
+        diagLog("OTA: geen Content-Length, kan niet flashen");
         http.end();
         return Result::ERROR_DOWNLOAD;
     }
 
+    diagLog("OTA: start flash %d bytes", contentLen);
+
     if (!Update.begin(contentLen)) {
-        Serial.printf("OTA Update.begin faalde: %s\n", Update.errorString());
+        diagLog("OTA Update.begin faalde: %s", Update.errorString());
         http.end();
         return Result::ERROR_FLASH;
     }
@@ -211,7 +196,7 @@ OtaUpdater::Result OtaUpdater::_downloadAndFlash(const String& url, const String
             int n = stream->readBytes(buf, toRead);
             if (n > 0) {
                 if (Update.write(buf, n) != (size_t)n) {
-                    Serial.printf("OTA Update.write faalde: %s\n", Update.errorString());
+                    diagLog("OTA Update.write faalde: %s", Update.errorString());
                     mbedtls_sha256_free(&ctx);
                     Update.abort();
                     http.end();
@@ -234,7 +219,7 @@ OtaUpdater::Result OtaUpdater::_downloadAndFlash(const String& url, const String
             // Timeout op basis van laatste ontvangen data, niet totale tijd —
             // http.connected() is onbetrouwbaar bij TLS en breekt te vroeg af.
             if (millis() - lastDataAt > 30000) {
-                Serial.println("OTA: download timeout (geen data)");
+                diagLog("OTA: download timeout (geen data na 30s)");
                 mbedtls_sha256_free(&ctx);
                 Update.abort();
                 http.end();
@@ -255,20 +240,20 @@ OtaUpdater::Result OtaUpdater::_downloadAndFlash(const String& url, const String
     String expectedLower = expectedSha;
     expectedLower.toLowerCase();
     if (String(hashHex) != expectedLower) {
-        Serial.printf("OTA SHA-256 mismatch: %s vs verwacht %s\n", hashHex, expectedLower.c_str());
+        diagLog("OTA SHA-256 mismatch: got %s", hashHex);
         Update.abort();
         http.end();
         return Result::ERROR_HASH;
     }
 
     if (!Update.end(true)) {
-        Serial.printf("OTA Update.end faalde: %s\n", Update.errorString());
+        diagLog("OTA Update.end faalde: %s", Update.errorString());
         http.end();
         return Result::ERROR_FLASH;
     }
 
     http.end();
-    Serial.println("OTA: flash klaar — reboot");
+    diagLog("OTA: flash klaar — reboot");
     delay(1500);
     ESP.restart();
     return Result::UPDATED_REBOOTING;
