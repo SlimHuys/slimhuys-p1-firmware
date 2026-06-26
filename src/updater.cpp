@@ -3,6 +3,7 @@
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
 #include <Update.h>
+#include <WiFiClientSecure.h>
 #include <esp_ota_ops.h>
 #include <mbedtls/sha256.h>
 
@@ -68,8 +69,11 @@ OtaUpdater::Result OtaUpdater::checkNow() {
         return _lastResult;
     }
 
+    WiFiClientSecure mc;
+    mc.setInsecure();
     HTTPClient http;
-    http.begin(_baseUrl + "/v1/firmware/manifest");
+    http.setTimeout(15000);
+    http.begin(mc, _baseUrl + "/v1/firmware/manifest");
     http.addHeader("Authorization", "Bearer " + _apiKey);
     http.addHeader("X-Firmware-Version", _currentVersion);
     http.addHeader("Accept", "application/json");
