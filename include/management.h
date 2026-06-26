@@ -61,6 +61,9 @@ public:
         _envHumidPct = humid_pct;
         _envValid = true;
     }
+    bool envValid() const { return _envValid; }
+    float envTempC() const { return _envTempC; }
+    float envHumidPct() const { return _envHumidPct; }
 
 private:
     void _setupRoutes();

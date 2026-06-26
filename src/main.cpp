@@ -586,6 +586,12 @@ void pushReading(P1Data& d) {
     // Gas
     if (d.gas_delivered_present) r["gas_total_m3"] = d.gas_delivered.val();
 
+    // Omgevingssensoren (HDC1080 temp + vocht) — nullable, alleen als geldig
+    if (management.envValid()) {
+        r["temp_c"] = round(management.envTempC() * 10.0f) / 10.0f;
+        r["humid_pct"] = round(management.envHumidPct() * 10.0f) / 10.0f;
+    }
+
     String payload;
     serializeJson(doc, payload);
 
