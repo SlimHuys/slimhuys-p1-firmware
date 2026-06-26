@@ -376,17 +376,25 @@ String makeHostname() {
 // DSMR-velden — zelfde shape als HACS-integration v0.4.0 + backend
 // ============================================================================
 using P1Data = ParsedData<
+    /* meter-timestamp     */ timestamp,
+    /* meter-serienummer   */ equipment_id,
     /* totalen tariff 1+2  */ energy_delivered_tariff1,
                               energy_delivered_tariff2,
                               energy_returned_tariff1,
                               energy_returned_tariff2,
+    /* actief tarief       */ electricity_tariff,
     /* actief vermogen     */ power_delivered,
                               power_returned,
+    /* stroomstoringen     */ electricity_failures,
+                              electricity_long_failures,
     /* currents per fase   */ current_l1, current_l2, current_l3,
     /* voltages per fase   */ voltage_l1, voltage_l2, voltage_l3,
+    /* spanningskwaliteit  */ electricity_sags_l1,   electricity_sags_l2,   electricity_sags_l3,
+                              electricity_swells_l1, electricity_swells_l2, electricity_swells_l3,
     /* power per fase      */ power_delivered_l1, power_delivered_l2, power_delivered_l3,
                               power_returned_l1,  power_returned_l2,  power_returned_l3,
-    /* gas                 */ gas_delivered>;
+    /* gas                 */ gas_delivered,
+    /* gas-serienummer     */ gas_equipment_id>;
 
 P1Reader reader(&P1Serial, P1_REQUEST_PIN);
 
@@ -472,6 +480,17 @@ void onNetworkEvent(WiFiEvent_t event) {
 
 bool networkReady() {
     return ethConnected || WiFi.status() == WL_CONNECTED;
+}
+
+// DSMR-timestamp "YYMMDDhhmmssX" (X=S zomer/W winter) → ISO 8601.
+String dsmrToIso8601(const String& ts) {
+    if (ts.length() < 13) return String();
+    char buf[32];
+    snprintf(buf, sizeof(buf), "20%c%c-%c%c-%c%cT%c%c:%c%c:%c%c%s",
+             ts[0], ts[1], ts[2], ts[3], ts[4], ts[5],
+             ts[6], ts[7], ts[8], ts[9], ts[10], ts[11],
+             (ts[12] == 'S' || ts[12] == 's') ? "+02:00" : "+01:00");
+    return String(buf);
 }
 
 String iso8601Now() {
@@ -584,7 +603,37 @@ void pushReading(P1Data& d) {
     if (d.power_returned_l3_present) r["active_power_returned_l3_w"] = (int)(d.power_returned_l3.val() * 1000);
 
     // Gas
-    if (d.gas_delivered_present) r["gas_total_m3"] = d.gas_delivered.val();
+    if (d.gas_delivered_present) {
+        r["gas_total_m3"] = d.gas_delivered.val();
+        String gasTs = dsmrToIso8601(d.gas_delivered.timestamp);
+        if (gasTs.length()) r["gas_timestamp"] = gasTs;
+    }
+
+    // Meter-timestamp (uit het telegram zelf)
+    if (d.timestamp_present) {
+        String meterTs = dsmrToIso8601(d.timestamp);
+        if (meterTs.length()) r["meter_timestamp"] = meterTs;
+    }
+
+    // Actief tarief (dal=1 / piek=2)
+    if (d.electricity_tariff_present && d.electricity_tariff.length())
+        r["tariff_indicator"] = d.electricity_tariff.toInt();
+
+    // Stroomstoringen (cumulatieve tellers)
+    if (d.electricity_failures_present)      r["power_failures"]      = d.electricity_failures;
+    if (d.electricity_long_failures_present) r["long_power_failures"]  = d.electricity_long_failures;
+
+    // Spanningskwaliteit per fase
+    if (d.electricity_sags_l1_present)   r["voltage_sags_l1"]   = d.electricity_sags_l1;
+    if (d.electricity_sags_l2_present)   r["voltage_sags_l2"]   = d.electricity_sags_l2;
+    if (d.electricity_sags_l3_present)   r["voltage_sags_l3"]   = d.electricity_sags_l3;
+    if (d.electricity_swells_l1_present) r["voltage_swells_l1"] = d.electricity_swells_l1;
+    if (d.electricity_swells_l2_present) r["voltage_swells_l2"] = d.electricity_swells_l2;
+    if (d.electricity_swells_l3_present) r["voltage_swells_l3"] = d.electricity_swells_l3;
+
+    // Serienummers (idempotent op API — meter_serial/gas_meter_serial gaan op p1_meters)
+    if (d.equipment_id_present     && d.equipment_id.length())     r["meter_serial"]     = d.equipment_id;
+    if (d.gas_equipment_id_present && d.gas_equipment_id.length()) r["gas_meter_serial"] = d.gas_equipment_id;
 
     // Omgevingssensoren (HDC1080 temp + vocht) — nullable, alleen als geldig
     if (management.envValid()) {
