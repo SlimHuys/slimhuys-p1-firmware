@@ -141,7 +141,15 @@ OtaUpdater::Result OtaUpdater::checkNow() {
         _currentVersion.c_str(), targetVersion.c_str(), _channel.c_str());
 
     _lastCheckAt = checkStarted;  // telt als succesvolle check; download-fout → 5min retry
-    _lastResult = _downloadAndFlash(url, sha256);
+
+    for (int attempt = 1; attempt <= 3; attempt++) {
+        if (attempt > 1) {
+            diagLog("OTA: download poging %d/3...", attempt);
+            delay(5000);
+        }
+        _lastResult = _downloadAndFlash(url, sha256);
+        if (_lastResult != Result::ERROR_DOWNLOAD) break;
+    }
     return _lastResult;
 }
 
