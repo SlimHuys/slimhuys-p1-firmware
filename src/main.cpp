@@ -906,6 +906,7 @@ void pushWaterReading(uint32_t total_l) {
     auto r = readings.add<JsonObject>();
     r["timestamp"] = iso8601Now();
     r["total_liter"] = total_l;
+    r["flow_lpm"] = round(currentFlowLpm * 10.0f) / 10.0f;
 
     String payload;
     serializeJson(doc, payload);
