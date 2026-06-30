@@ -1066,19 +1066,24 @@ void setup() {
     // Arduino-ESP32 pre-initialiseert de TWDT met CONFIG_ESP_TASK_WDT_TIMEOUT_S
     // = 5s. De push-worker subscribeert via esp_task_wdt_add() en zijn
     // queue-wait is pdMS_TO_TICKS(5000) — exact gelijk aan die 5s. Race-to-crash
-    // na precies 2 queue-cycli (~10s). esp_task_wdt_init() updatet de bestaande
-    // TWDT in-place (timeout + panic-flag) zonder subscriptions te wissen.
+    // na precies 2 queue-cycli (~10s).
     // Hoofd-taak subscribeert pas ná setup (zie verderop) zodat captive-portal
     // onbeperkt kan lopen zonder WDT te triggeren.
 #ifdef BOARD_V4
-    // ESP-IDF 5.x: esp_task_wdt_init verwacht een config-struct
+    // ESP-IDF 5.x: de TWDT is door de Arduino-core al geïnitialiseerd, dus
+    // esp_task_wdt_init() geeft ESP_ERR_INVALID_STATE en wijzigt NIETS — de
+    // timeout bleef daardoor op 5s staan en de push-worker tripte de WDT elke
+    // cyclus. esp_task_wdt_reconfigure() updatet de bestaande TWDT (timeout +
+    // panic-flag) in-place zonder subscriptions te wissen.
     {
         esp_task_wdt_config_t wdt_cfg = {
             .timeout_ms = WDT_TIMEOUT_S * 1000,
             .idle_core_mask = 0,
             .trigger_panic = true,
         };
-        esp_task_wdt_init(&wdt_cfg);
+        if (esp_task_wdt_init(&wdt_cfg) == ESP_ERR_INVALID_STATE) {
+            esp_task_wdt_reconfigure(&wdt_cfg);
+        }
     }
 #else
     esp_task_wdt_init(WDT_TIMEOUT_S, true);
