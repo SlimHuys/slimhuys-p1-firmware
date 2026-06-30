@@ -16,17 +16,22 @@ if [[ -z "$VERSION" ]]; then
   exit 1
 fi
 
-echo "→ Building firmware v$VERSION"
-pio run
+echo "→ Building firmware v$VERSION (V3 + V4)"
+pio run -e smarthomeshop-v3
+pio run -e smarthomeshop-v4
 
 OUT="release/$VERSION"
-mkdir -p "$OUT"
+mkdir -p "$OUT/v3" "$OUT/v4"
 
-cp .pio/build/smarthomeshop-v3/firmware.bin        "$OUT/firmware.bin"
-cp .pio/build/smarthomeshop-v3/firmware-merged.bin "$OUT/firmware-merged.bin"
+# V3 (ESP32 + LAN8720)
+cp .pio/build/smarthomeshop-v3/firmware.bin        "$OUT/v3/firmware.bin"
+cp .pio/build/smarthomeshop-v3/firmware-merged.bin "$OUT/v3/firmware-merged.bin"
+shasum -a 256 "$OUT/v3/firmware.bin" | awk '{print $1}' > "$OUT/v3/firmware.bin.sha256"
 
-# Sha256 sidecar voor OTA-integriteitscheck door de bridge.
-shasum -a 256 "$OUT/firmware.bin" | awk '{print $1}' > "$OUT/firmware.bin.sha256"
+# V4 (ESP32-C6 + W5500)
+cp .pio/build/smarthomeshop-v4/firmware.bin        "$OUT/v4/firmware.bin"
+cp .pio/build/smarthomeshop-v4/firmware-merged.bin "$OUT/v4/firmware-merged.bin"
+shasum -a 256 "$OUT/v4/firmware.bin" | awk '{print $1}' > "$OUT/v4/firmware.bin.sha256"
 
 cat > "$OUT/manifest.json" <<EOF
 {
@@ -37,7 +42,13 @@ cat > "$OUT/manifest.json" <<EOF
     {
       "chipFamily": "ESP32",
       "parts": [
-        { "path": "firmware-merged.bin", "offset": 0 }
+        { "path": "v3/firmware-merged.bin", "offset": 0 }
+      ]
+    },
+    {
+      "chipFamily": "ESP32-C6",
+      "parts": [
+        { "path": "v4/firmware-merged.bin", "offset": 0 }
       ]
     }
   ]
@@ -46,7 +57,7 @@ EOF
 
 echo
 echo "✓ Release-artefacten in $OUT/"
-ls -lh "$OUT"
+ls -lh "$OUT/v3/" "$OUT/v4/"
 echo
 echo "Lokaal testen (python http-server):"
 echo "  cd $OUT && python3 -m http.server 8000"

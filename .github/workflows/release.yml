@@ -45,14 +45,17 @@ jobs:
       - name: Stage artefacten
         run: |
           mkdir -p release
-          cp .pio/build/smarthomeshop-v3/firmware.bin        release/firmware.bin
-          cp .pio/build/smarthomeshop-v3/firmware-merged.bin release/firmware-merged.bin
+          # V3 (ESP32 + LAN8720)
+          cp .pio/build/smarthomeshop-v3/firmware.bin        release/firmware-v3.bin
+          cp .pio/build/smarthomeshop-v3/firmware-merged.bin release/firmware-merged-v3.bin
+          sha256sum release/firmware-v3.bin | awk '{print $1}' > release/firmware-v3.bin.sha256
 
-          # Sha256 sidecar voor OTA-integriteitscheck door de bridge
-          # (slimhuys.nl/v1/firmware/manifest leest dit en stuurt het mee).
-          sha256sum release/firmware.bin | awk '{print $1}' > release/firmware.bin.sha256
+          # V4 (ESP32-C6 + W5500)
+          cp .pio/build/smarthomeshop-v4/firmware.bin        release/firmware-v4.bin
+          cp .pio/build/smarthomeshop-v4/firmware-merged.bin release/firmware-merged-v4.bin
+          sha256sum release/firmware-v4.bin | awk '{print $1}' > release/firmware-v4.bin.sha256
 
-          BIN_URL="https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/firmware-merged.bin"
+          BASE="https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}"
 
           cat > release/manifest.json <<EOF
           {
@@ -63,7 +66,13 @@ jobs:
               {
                 "chipFamily": "ESP32",
                 "parts": [
-                  { "path": "${BIN_URL}", "offset": 0 }
+                  { "path": "${BASE}/firmware-merged-v3.bin", "offset": 0 }
+                ]
+              },
+              {
+                "chipFamily": "ESP32-C6",
+                "parts": [
+                  { "path": "${BASE}/firmware-merged-v4.bin", "offset": 0 }
                 ]
               }
             ]
@@ -76,8 +85,11 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            release/firmware.bin
-            release/firmware.bin.sha256
-            release/firmware-merged.bin
+            release/firmware-v3.bin
+            release/firmware-v3.bin.sha256
+            release/firmware-merged-v3.bin
+            release/firmware-v4.bin
+            release/firmware-v4.bin.sha256
+            release/firmware-merged-v4.bin
             release/manifest.json
           generate_release_notes: true
