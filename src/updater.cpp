@@ -3,6 +3,7 @@
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
 #include <Update.h>
+#include <WiFiClient.h>
 #include <WiFiClientSecure.h>
 #include <esp_ota_ops.h>
 #include <mbedtls/sha256.h>

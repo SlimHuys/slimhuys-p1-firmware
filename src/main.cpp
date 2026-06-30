@@ -5,17 +5,29 @@
  * beide naar SlimHuys' /v1/me/readings + /v1/me/water-readings over
  * ethernet (LAN8720 + PoE) of WiFi-fallback.
  *
- * Pin-mapping (smarthomeshop WaterP1MeterKit V3):
- *   GPIO 16 ← P1-data (software-inverted UART, geen NPN nodig)
+ * Pin-mapping (smarthomeshop WaterP1MeterKit V3 — esp32dev, LAN8720 PoE):
+ *   GPIO 16 ← P1-data (software-inverted UART2, geen NPN nodig)
  *   GPIO 12 → P1-request (data-trigger naar slimme meter)
- *   GPIO 5  → RGB-indicator: rood kanaal (LEDC PWM)
- *   GPIO 13 → RGB-indicator: groen kanaal
- *   GPIO 14 → RGB-indicator: blauw kanaal
+ *   GPIO 5  → RGB-indicator: rood kanaal (LEDC PWM ch0)
+ *   GPIO 13 → RGB-indicator: groen kanaal (ch1)
+ *   GPIO 14 → RGB-indicator: blauw kanaal (ch2)
  *   GPIO 32 ← water-pulse (reed-switch, 1 puls = 1L default)
  *   GPIO 2  ← waterlek-sensor (active-low, INPUT_PULLUP)
  *   GPIO 15 ↔ I²C SDA (HDC1080 temp+vocht)
  *   GPIO 4  → I²C SCL
  *   LAN8720 PHY → ethernet RJ45 (MDC=23, MDIO=18, CLK=17_OUT, PWR=33, addr=1)
+ *
+ * Pin-mapping (smarthomeshop WaterP1MeterKit V4 — ESP32-C6, W5500 SPI):
+ *   GPIO 1  ← P1-data (software-inverted UART1, geen NPN nodig)
+ *   GPIO 10 → P1-request (data-trigger naar slimme meter)
+ *   GPIO 13 → RGB-indicator: rood kanaal (LEDC PWM)
+ *   GPIO 12 → RGB-indicator: groen kanaal
+ *   GPIO 11 → RGB-indicator: blauw kanaal
+ *   GPIO 0  ← water-pulse (reed-switch, 1 puls = 1L default)
+ *   GPIO 5  ← waterlek/expansie-sensor (active-low, INPUT_PULLUP)
+ *   GPIO 6  ↔ I²C SDA (HDC1080 temp+vocht)
+ *   GPIO 7  → I²C SCL
+ *   W5500 SPI-ethernet: PWR=18(act-low), SCK=23, MISO=22, MOSI=21, CS=15, INT=20, RST=19
  *
  * Provisioning: bij eerste boot start een captive-portal op SSID
  * "SlimHuys-Setup-XXXX". User kiest WiFi + vult de 6-cijferige
@@ -26,6 +38,11 @@
 #include <Arduino.h>
 #include <ESPmDNS.h>
 #include <ETH.h>
+#ifdef BOARD_V4
+#include <SPI.h>
+#include <esp_mac.h>       // esp_read_mac + ESP_MAC_WIFI_STA (in ESP-IDF 5.x apart van esp_system.h)
+#include <esp_task_wdt.h>  // esp_task_wdt_config_t (andere signatuur in IDF 5.x)
+#endif
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
@@ -52,18 +69,48 @@ using namespace dsmr::fields;
 // ============================================================================
 // Configuration
 // ============================================================================
-constexpr int P1_RX_PIN = 16;       // DSMR-data (software-inverted UART)
-constexpr int P1_REQUEST_PIN = 12;  // Data-trigger naar slimme meter (DTR)
-constexpr int LED_R_PIN = 5;        // Rood kanaal RGB-indicator
-constexpr int LED_G_PIN = 13;       // Groen kanaal
-constexpr int LED_B_PIN = 14;       // Blauw kanaal
+#ifdef BOARD_V4
+// smarthomeshop WaterP1MeterKit V4 — ESP32-C6 + W5500 SPI ethernet
+constexpr int P1_RX_PIN = 1;
+constexpr int P1_REQUEST_PIN = 10;
+constexpr int LED_R_PIN = 13;
+constexpr int LED_G_PIN = 12;
+constexpr int LED_B_PIN = 11;
+constexpr int WATER_PULSE_PIN = 0;
+constexpr int WATER_LEAK_PIN = 5;
+constexpr int I2C_SDA_PIN = 6;
+constexpr int I2C_SCL_PIN = 7;
+// W5500 SPI ethernet — power-enable actief-laag (GPIO18 LOW = aan)
+constexpr int ETH_PWR_PIN  = 18;
+constexpr int ETH_SCK_PIN  = 23;
+constexpr int ETH_MISO_PIN = 22;
+constexpr int ETH_MOSI_PIN = 21;
+constexpr int ETH_CS_PIN   = 15;
+constexpr int ETH_INT_PIN  = 20;
+constexpr int ETH_RST_PIN  = 19;
+// LEDC: V4 gebruikt de arduino-esp32 3.x pin-gebaseerde API — geen channelnummers
+#define LED_R_ID LED_R_PIN
+#define LED_G_ID LED_G_PIN
+#define LED_B_ID LED_B_PIN
+#else
+// smarthomeshop WaterP1MeterKit V3 — ESP32 + LAN8720 RMII ethernet (PoE)
+constexpr int P1_RX_PIN = 16;
+constexpr int P1_REQUEST_PIN = 12;
+constexpr int LED_R_PIN = 5;
+constexpr int LED_G_PIN = 13;
+constexpr int LED_B_PIN = 14;
 constexpr int LEDC_CH_R = 0;
 constexpr int LEDC_CH_G = 1;
 constexpr int LEDC_CH_B = 2;
-constexpr int WATER_PULSE_PIN = 32; // Reed-switch op water-meter
-constexpr int WATER_LEAK_PIN = 2;   // Lekkage-sensor (LOW=leak, INPUT_PULLUP)
-constexpr int I2C_SDA_PIN = 15;     // HDC1080 temp+vocht
+constexpr int WATER_PULSE_PIN = 32;
+constexpr int WATER_LEAK_PIN = 2;
+constexpr int I2C_SDA_PIN = 15;
 constexpr int I2C_SCL_PIN = 4;
+// LEDC: V3 gebruikt de arduino-esp32 2.x channel-gebaseerde API
+#define LED_R_ID LEDC_CH_R
+#define LED_G_ID LEDC_CH_G
+#define LED_B_ID LEDC_CH_B
+#endif
 constexpr uint8_t HDC1080_ADDR = 0x40;
 constexpr unsigned long HDC_READ_INTERVAL_MS = 30000; // 1×/30s — ruim genoeg
 // Self-heating compensatie — HDC1080 zit naast de ESP32 die warmte+droogte
@@ -121,7 +168,11 @@ constexpr unsigned long WATER_DEBOUNCE_US = 50000; // 50ms reed-switch debounce
 // State
 // ============================================================================
 Preferences prefs;
-HardwareSerial P1Serial(2);
+#ifdef BOARD_V4
+HardwareSerial P1Serial(1);  // UART1 (ESP32-C6 heeft geen UART2)
+#else
+HardwareSerial P1Serial(2);  // UART2
+#endif
 ManagementInterface management;
 OtaUpdater updater;
 String apiKey;
@@ -277,9 +328,16 @@ bool enqueuePush(const String& url, const String& method, const String& payload,
 // initLeds(), daarna elke mode-transition gewoon ledcSetup (frequency)
 // + ledcWrite (duty). Hardware doet de blink, geen Ticker nodig.
 // ============================================================================
-static void ledWrite(int channel, uint32_t freq_hz, uint8_t duty) {
-    ledcSetup(channel, freq_hz, 8);
-    ledcWrite(channel, duty);
+// V3 (arduino-esp32 2.x): id = LEDC channel-nummer; ledcSetup + ledcWrite.
+// V4 (arduino-esp32 3.x): id = GPIO pin-nummer;    ledcChangeFrequency + ledcWrite.
+static void ledWrite(int id, uint32_t freq_hz, uint8_t duty) {
+#ifdef BOARD_V4
+    ledcChangeFrequency(id, freq_hz, 8);
+    ledcWrite(id, duty);
+#else
+    ledcSetup(id, freq_hz, 8);
+    ledcWrite(id, duty);
+#endif
 }
 
 void setLedMode(LedMode mode) {
@@ -287,31 +345,39 @@ void setLedMode(LedMode mode) {
     currentLedMode = mode;
 
     // Reset alle kanalen naar uit
-    ledWrite(LEDC_CH_R, 5000, 0);
-    ledWrite(LEDC_CH_G, 5000, 0);
-    ledWrite(LEDC_CH_B, 5000, 0);
+    ledWrite(LED_R_ID, 5000, 0);
+    ledWrite(LED_G_ID, 5000, 0);
+    ledWrite(LED_B_ID, 5000, 0);
 
     switch (mode) {
         case LedMode::BOOT:
         case LedMode::OPERATIONAL:
-            ledWrite(LEDC_CH_G, 5000, 255);  // groen continu
+            ledWrite(LED_G_ID, 5000, 255);  // groen continu
             break;
         case LedMode::PAIRING:
-            ledWrite(LEDC_CH_B, 1, 128);     // 1Hz pulse blauw
+            ledWrite(LED_B_ID, 1, 128);     // 1Hz pulse blauw
             break;
         case LedMode::ERROR:
-            ledWrite(LEDC_CH_R, 5000, 255);  // rood continu
+            ledWrite(LED_R_ID, 5000, 255);  // rood continu
             break;
         case LedMode::LEAK_ALARM:
-            ledWrite(LEDC_CH_R, 4, 128);     // 4Hz blink rood
+            ledWrite(LED_R_ID, 4, 128);     // 4Hz blink rood
             break;
     }
 }
 
 void initLeds() {
+#ifdef BOARD_V4
+    // arduino-esp32 3.x: pin-gebaseerde attach (geen channelnummers)
+    ledcAttach(LED_R_PIN, 5000, 8);
+    ledcAttach(LED_G_PIN, 5000, 8);
+    ledcAttach(LED_B_PIN, 5000, 8);
+#else
+    // arduino-esp32 2.x: channel-gebaseerde attach
     ledcAttachPin(LED_R_PIN, LEDC_CH_R);
     ledcAttachPin(LED_G_PIN, LEDC_CH_G);
     ledcAttachPin(LED_B_PIN, LEDC_CH_B);
+#endif
     setLedMode(LedMode::BOOT);
 }
 
@@ -403,7 +469,17 @@ P1Reader reader(&P1Serial, P1_REQUEST_PIN);
 // ============================================================================
 
 void ethPhyInit() {
-    // Power-cycle LAN8720 NRST (GPIO33): 500ms laag, 500ms hoog.
+#ifdef BOARD_V4
+    // V4: W5500 SPI ethernet. Power-enable actief-laag (GPIO18 LOW = aan).
+    pinMode(ETH_PWR_PIN, OUTPUT);
+    digitalWrite(ETH_PWR_PIN, LOW);
+    delay(100);
+    SPI.begin(ETH_SCK_PIN, ETH_MISO_PIN, ETH_MOSI_PIN, -1);
+    diagLog("ETH.begin() (W5500 SPI cs=%d int=%d rst=%d)", ETH_CS_PIN, ETH_INT_PIN, ETH_RST_PIN);
+    bool ok = ETH.begin(ETH_PHY_W5500, -1, ETH_CS_PIN, ETH_INT_PIN, ETH_RST_PIN, SPI);
+    diagLog("ETH.begin() return: %s", ok ? "true" : "false");
+#else
+    // V3: LAN8720 RMII ethernet. Power-cycle NRST (GPIO33): 500ms laag, 500ms hoog.
     // Library-reset overgeslagen (power=-1) omdat we het handmatig doen.
     pinMode(33, OUTPUT);
     digitalWrite(33, LOW);
@@ -415,6 +491,7 @@ void ethPhyInit() {
                         /*mdc*/ 23, /*mdio*/ 18,
                         ETH_PHY_LAN8720, ETH_CLOCK_GPIO17_OUT);
     diagLog("ETH.begin() return: %s", ok ? "true" : "false");
+#endif
 }
 
 void onNetworkEvent(WiFiEvent_t event) {
@@ -790,9 +867,16 @@ bool enqueuePush(const String& url, const String& method, const String& payload,
 
 void initPushWorker() {
     pushQueue = xQueueCreate(10, sizeof(PushJob*));
+#ifdef BOARD_V4
+    // ESP32-C6 is single-core — xTaskCreatePinnedToCore bestaat niet.
+    xTaskCreate(
+        pushWorkerTask, "push-worker", 8192, nullptr,
+        1 /* priority */, &pushTaskHandle);
+#else
     xTaskCreatePinnedToCore(
         pushWorkerTask, "push-worker", 8192, nullptr,
         1 /* priority */, &pushTaskHandle, 0 /* core 0 */);
+#endif
 }
 
 // ============================================================================
@@ -986,7 +1070,19 @@ void setup() {
     // TWDT in-place (timeout + panic-flag) zonder subscriptions te wissen.
     // Hoofd-taak subscribeert pas ná setup (zie verderop) zodat captive-portal
     // onbeperkt kan lopen zonder WDT te triggeren.
+#ifdef BOARD_V4
+    // ESP-IDF 5.x: esp_task_wdt_init verwacht een config-struct
+    {
+        esp_task_wdt_config_t wdt_cfg = {
+            .timeout_ms = WDT_TIMEOUT_S * 1000,
+            .idle_core_mask = 0,
+            .trigger_panic = true,
+        };
+        esp_task_wdt_init(&wdt_cfg);
+    }
+#else
     esp_task_wdt_init(WDT_TIMEOUT_S, true);
+#endif
 
     // Push-worker draait op core 0 — main-loop (core 1) blokkeert nu niet
     // meer 50-400ms per push. Initialiseren vóór de eerste enqueuePush.
@@ -1152,7 +1248,11 @@ void setup() {
     if (!safeMode) {
         P1Serial.setRxBufferSize(2048);
         P1Serial.begin(115200, SERIAL_8N1, P1_RX_PIN, -1);
+#ifdef BOARD_V4
+        uart_set_line_inverse(UART_NUM_1, UART_SIGNAL_RXD_INV);
+#else
         uart_set_line_inverse(UART_NUM_2, UART_SIGNAL_RXD_INV);
+#endif
         reader.enable(true);
     }
 
@@ -1175,9 +1275,9 @@ void loop() {
         Serial.println("Bootloop-counter gereset (60s+ uptime stabiel).");
     }
 
-    // ETH PHY power-cycle: als de driver draait maar na 15s nog geen link,
-    // alleen GPIO33 LOW/HIGH — ETH.begin() NIET opnieuw (driver draait al,
-    // tweede aanroep geeft false). Driver detecteert link via MDIO-polling.
+#ifndef BOARD_V4
+    // V3 only: LAN8720 PHY power-cycle als driver draait maar na 15s nog geen link.
+    // ETH.begin() NIET opnieuw (driver draait al, tweede aanroep geeft false).
     if (!ethPhyRetried && ethDriverStartedAt > 0
             && !ETH.linkUp() && millis() - ethDriverStartedAt >= 15000) {
         ethPhyRetried = true;
@@ -1187,6 +1287,7 @@ void loop() {
         delay(500);
         digitalWrite(33, HIGH);
     }
+#endif
 
     // ETH-DHCP-refresh: direct na ETH_CONNECTED (via vlag) en éénmalige
     // retry na 30s. Niet in de event-handler — interfereert met auto-DHCP.
@@ -1341,14 +1442,14 @@ void loop() {
     if (waterPulseFlashRequested) {
         waterPulseFlashRequested = false;
         if (currentLedMode == LedMode::OPERATIONAL) {
-            ledcWrite(LEDC_CH_B, 80);   // moderate blue overlay → cyan met groen
+            ledcWrite(LED_B_ID, 80);    // moderate blue overlay → cyan met groen
             waterPulseFlashUntil = now + 50;
         }
     }
     if (waterPulseFlashUntil > 0 && now >= waterPulseFlashUntil) {
         waterPulseFlashUntil = 0;
         if (currentLedMode == LedMode::OPERATIONAL) {
-            ledcWrite(LEDC_CH_B, 0);    // terug naar pure groen
+            ledcWrite(LED_B_ID, 0);     // terug naar pure groen
         }
     }
 
