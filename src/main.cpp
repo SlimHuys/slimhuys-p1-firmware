@@ -293,9 +293,10 @@ volatile bool forceSecureClientReset = false;
 // bijgewerkt (race tussen state-change en callback).
 volatile bool leakPushInFlight = false;
 
-// LED-state-machine. LEDC PWM doet de blinks autonoom in hardware,
-// dus de loop hoeft niks te toggle'en. Mode-transitions schrijven alleen
-// nieuwe frequenties + duty naar de channels.
+// LED-state-machine. V3: LEDC-PWM doet de blinks autonoom in hardware (de
+// blink-frequentie ÍS de PWM-frequentie). V4 (C6): de LEDC kan niet traag genoeg
+// klokken, dus de blink-modes toggelen de duty via een Ticker (zie ledStartBlink).
+// Mode-transitions schrijven alleen nieuwe frequenties + duty naar de channels.
 enum class LedMode {
     BOOT,           // groene continue (alles ok bij boot)
     PAIRING,        // blauwe pulse — captive-portal actief
@@ -340,9 +341,49 @@ static void ledWrite(int id, uint32_t freq_hz, uint8_t duty) {
 #endif
 }
 
+#ifdef BOARD_V4
+// Software-blink voor V4. De C6-LEDC kan niet traag genoeg klokken voor een
+// 1-4Hz PWM-blink: bij 8-bit resolutie ligt de laagst haalbare frequentie in
+// de tientallen-tot-honderden Hz (freq = clk / (256 × div), div max ~1024), dus
+// ledcChangeFrequency(id, 1..4, 8) faalt ("div_param=0"). We toggelen daarom de
+// duty via een Ticker (esp_timer-task), die ook blijft lopen terwijl de
+// captive-portal de main-loop blokkeert. De PWM-frequentie blijft op de bij
+// initLeds() ingestelde 5kHz; alleen de duty gaat aan/uit. V3 houdt de
+// hardware-PWM-blink (zie ledWrite/#else).
+#include <Ticker.h>
+static Ticker  ledBlinkTicker;
+static int     ledBlinkId   = -1;     // welk kanaal knippert (-1 = geen)
+static uint8_t ledBlinkDuty = 0;      // brightness tijdens de aan-fase
+static bool    ledBlinkOn   = false;
+
+static void ledBlinkTick() {
+    if (ledBlinkId < 0) return;
+    ledBlinkOn = !ledBlinkOn;
+    ledcWrite(ledBlinkId, ledBlinkOn ? ledBlinkDuty : 0);
+}
+
+static void ledStartBlink(int id, float hz, uint8_t duty) {
+    ledBlinkTicker.detach();
+    ledBlinkId   = id;
+    ledBlinkDuty = duty;
+    ledBlinkOn   = true;
+    ledcWrite(id, duty);
+    ledBlinkTicker.attach(0.5f / hz, ledBlinkTick);  // halve periode = aan = uit
+}
+
+static void ledStopBlink() {
+    ledBlinkTicker.detach();
+    ledBlinkId = -1;
+}
+#endif
+
 void setLedMode(LedMode mode) {
     if (mode == currentLedMode) return;
     currentLedMode = mode;
+
+#ifdef BOARD_V4
+    ledStopBlink();  // eventuele vorige software-blink stoppen
+#endif
 
     // Reset alle kanalen naar uit
     ledWrite(LED_R_ID, 5000, 0);
@@ -355,13 +396,21 @@ void setLedMode(LedMode mode) {
             ledWrite(LED_G_ID, 5000, 255);  // groen continu
             break;
         case LedMode::PAIRING:
+#ifdef BOARD_V4
+            ledStartBlink(LED_B_ID, 1.0f, 200);  // 1Hz pulse blauw (software)
+#else
             ledWrite(LED_B_ID, 1, 128);     // 1Hz pulse blauw
+#endif
             break;
         case LedMode::ERROR:
             ledWrite(LED_R_ID, 5000, 255);  // rood continu
             break;
         case LedMode::LEAK_ALARM:
+#ifdef BOARD_V4
+            ledStartBlink(LED_R_ID, 4.0f, 255);  // 4Hz blink rood (software)
+#else
             ledWrite(LED_R_ID, 4, 128);     // 4Hz blink rood
+#endif
             break;
     }
 }
