@@ -65,6 +65,7 @@ OtaUpdater::Result OtaUpdater::checkNow() {
     // na CHECK_RETRY_INTERVAL_MS (5min) opnieuw geprobeerd wordt i.p.v.
     // 24u te wachten.
     unsigned long checkStarted = millis();
+    _lastHttpStatus = 0;
 
     if (_baseUrl.isEmpty() || _apiKey.isEmpty()) {
         _lastCheckAt = checkStarted;
@@ -79,10 +80,16 @@ OtaUpdater::Result OtaUpdater::checkNow() {
     http.begin(mc, _baseUrl + "/v1/firmware/manifest");
     http.addHeader("Authorization", "Bearer " + _apiKey);
     http.addHeader("X-Firmware-Version", _currentVersion);
+#ifdef BOARD_V4
+    http.addHeader("X-Hardware-Variant", "v4");  // ESP32-C6 → firmware-v4.bin
+#else
+    http.addHeader("X-Hardware-Variant", "v3");  // ESP32 → firmware-v3.bin
+#endif
     http.addHeader("Accept", "application/json");
     http.addHeader("User-Agent", "slimhuys-p1/" + _currentVersion);
 
     int status = http.GET();
+    _lastHttpStatus = status;
 
     if (status == 204) {
         // Geen update beschikbaar voor dit channel / deze bridge

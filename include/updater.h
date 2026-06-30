@@ -8,8 +8,13 @@
  *   GET <base_url>/v1/firmware/manifest
  *   Headers: Authorization: Bearer <api_key>
  *            X-Firmware-Version: <current>
+ *            X-Hardware-Variant: v3 | v4   (ESP32 vs ESP32-C6 — bepaalt welke
+ *                                           release-asset de backend teruggeeft)
  *   Response (200): { "version", "url", "sha256", "notes", "channel" }
  *   Response (204): geen update beschikbaar voor deze bridge / dit channel
+ *
+ *   N.B. de backend MOET 204 geven (niet 404) als er geen update is óf GitHub
+ *   transient onbereikbaar is — 404 wordt als harde fout getoond in de UI.
  *
  * Roll-back: na succesvolle boot moet main-code expliciet
  * markValid() aanroepen (bijv. na eerste API-push), anders rollback
@@ -46,6 +51,9 @@ public:
     String channel() const { return _channel; }
     long lastCheckAtMsAgo() const;
     Result lastResult() const { return _lastResult; }
+    // HTTP-status van de laatste manifest-poll: >0 = server antwoordde (bv. 404),
+    // <=0 = geen verbinding (HTTPClient-foutcode), 0 = nog niet gepolld / config leeg.
+    int lastHttpStatus() const { return _lastHttpStatus; }
 
 private:
     String _baseUrl;
@@ -59,6 +67,7 @@ private:
     String _availableNotes;
     String _channel;
     Result _lastResult = Result::UP_TO_DATE;
+    int _lastHttpStatus = 0;
 
     bool _validMarked = false;
 

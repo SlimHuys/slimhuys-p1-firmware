@@ -260,7 +260,17 @@ void ManagementInterface::_handleCheckUpdate() {
     switch (r) {
         case OtaUpdater::Result::UP_TO_DATE: doc["status"] = "up_to_date"; break;
         case OtaUpdater::Result::UPDATED_REBOOTING: doc["status"] = "rebooting"; break;
-        case OtaUpdater::Result::ERROR_NETWORK: doc["status"] = "error"; doc["error"] = "network"; break;
+        case OtaUpdater::Result::ERROR_NETWORK:
+            doc["status"] = "error";
+            // Onderscheid server-respons (bv. 404) van een echte connectie-fout:
+            // anders verbergt "network" een backend-probleem (zie OTA-zijspoor).
+            if (_updater->lastHttpStatus() > 0) {
+                doc["error"] = "http_" + String(_updater->lastHttpStatus());
+                doc["http_status"] = _updater->lastHttpStatus();
+            } else {
+                doc["error"] = "no_connection";
+            }
+            break;
         case OtaUpdater::Result::ERROR_MANIFEST: doc["status"] = "error"; doc["error"] = "manifest"; break;
         case OtaUpdater::Result::ERROR_DOWNLOAD: doc["status"] = "error"; doc["error"] = "download"; break;
         case OtaUpdater::Result::ERROR_HASH: doc["status"] = "error"; doc["error"] = "hash_mismatch"; break;
@@ -774,7 +784,15 @@ function checkUpdate() {
       statusEl.textContent = 'Geen update beschikbaar.';
       btn.disabled = false;
     } else {
-      statusEl.textContent = 'Fout: ' + (d.error || 'onbekend');
+      var msg;
+      if (d.http_status) {
+        msg = 'Server gaf HTTP ' + d.http_status + ' — backend/manifest-probleem.';
+      } else if (d.error === 'no_connection') {
+        msg = 'Geen verbinding met de update-server.';
+      } else {
+        msg = 'Fout: ' + (d.error || 'onbekend');
+      }
+      statusEl.textContent = msg;
       btn.disabled = false;
     }
     refresh();
