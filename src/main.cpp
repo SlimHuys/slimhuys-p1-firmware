@@ -48,6 +48,7 @@
 #include <Preferences.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <lwip/dns.h>
 #include <Wire.h>
 #include <dsmr.h>
 #include <driver/uart.h>
@@ -180,10 +181,11 @@ String baseUrl;
 String deviceHostname;
 volatile bool ethConnected = false;
 unsigned long ethLinkUpAt = 0;      // tijdstip waarop ETH-kabel verbonden werd
-unsigned long ethDriverStartedAt = 0; // tijdstip waarop ETH-driver gestart is
 volatile bool ethDhcpRefreshNeeded = false;  // vlag: loop moet DHCP herstarten
 bool ethDhcpRetried = false;                 // éénmalige 30s-retry al gedaan?
-bool ethPhyRetried = false;                  // éénmalige PHY-herstart al gedaan?
+#ifndef BOARD_V4
+esp_eth_handle_t ethHandle = nullptr;        // uit ETHERNET_EVENT_START, voor PHY-registertoegang
+#endif
 unsigned long lastPushAt = 0;
 unsigned long lastWaterPushAt = 0;
 unsigned long lastWaterPersistAt = 0;
@@ -282,6 +284,10 @@ TaskHandle_t pushTaskHandle = nullptr;
 String wifiSsid;
 String wifiPass;
 unsigned long lastWifiReconnectAt = 0;
+// DNS-servers uit de WiFi-DHCP-lease. lwIP heeft één globale DNS-tabel; een
+// ETH-interface die op- en neergaat zonder lease kan die leegmaken, waarna
+// alle HTTPS-calls over WiFi falen. De loop zet ze dan terug.
+IPAddress wifiDns[2];
 
 // Signaal vanuit netwerk-event naar push-worker: secureClient resetten
 // na WiFi/ETH reconnect zodat de eerste post-reconnect push meteen een
@@ -528,20 +534,74 @@ void ethPhyInit() {
     bool ok = ETH.begin(ETH_PHY_W5500, -1, ETH_CS_PIN, ETH_INT_PIN, ETH_RST_PIN, SPI);
     diagLog("ETH.begin() return: %s", ok ? "true" : "false");
 #else
-    // V3: LAN8720 RMII ethernet. Power-cycle NRST (GPIO33): 500ms laag, 500ms hoog.
-    // Library-reset overgeslagen (power=-1) omdat we het handmatig doen.
-    pinMode(33, OUTPUT);
-    digitalWrite(33, LOW);
-    delay(500);
-    digitalWrite(33, HIGH);
-    delay(500);
+    // V3: LAN8720 RMII ethernet. GPIO33 (NRST) laten we door de driver
+    // bedienen, net als ESPHome en v0.4.0: die reset de PHY pas nadat de
+    // EMAC de 50MHz REF_CLK op GPIO17 heeft gestart (REF_CLK-in-modus). De
+    // handmatige power-cycles uit v0.7.30-35 losten niets op — die link-
+    // problemen bleken hardware (zie /api/log PHY-regels en /api/phy).
     diagLog("ETH.begin() (phy=1 pwr=33 mdc=23 mdio=18 LAN8720 clk17out)");
-    bool ok = ETH.begin(/*phy_addr*/ 1, /*power*/ -1,
+    bool ok = ETH.begin(/*phy_addr*/ 1, /*power*/ 33,
                         /*mdc*/ 23, /*mdio*/ 18,
                         ETH_PHY_LAN8720, ETH_CLOCK_GPIO17_OUT);
     diagLog("ETH.begin() return: %s", ok ? "true" : "false");
 #endif
 }
+
+#ifndef BOARD_V4
+// LAN8720 PHY-registers via de ESP-IDF mediator. esp_eth_driver_t (IDF 4.4)
+// heeft de mediator als eerste member, dus de handle is ook een mediator-ptr —
+// zo praten de PHY-drivers zelf ook met de MAC.
+constexpr uint32_t LAN8720_PHY_ADDR = 1;
+
+bool lan8720Write(uint32_t reg, uint32_t val) {
+    if (!ethHandle) return false;
+    auto* med = reinterpret_cast<esp_eth_mediator_t*>(ethHandle);
+    for (int i = 0; i < 5; i++) {
+        if (med->phy_reg_write(med, LAN8720_PHY_ADDR, reg, val) == ESP_OK) return true;
+        delay(2);
+    }
+    return false;
+}
+
+bool lan8720Read(uint32_t reg, uint32_t& val) {
+    if (!ethHandle) return false;
+    auto* med = reinterpret_cast<esp_eth_mediator_t*>(ethHandle);
+    // MII-bus wordt gedeeld met de link-check timer van de driver; bij een
+    // botsing geeft de MAC INVALID_STATE → kort opnieuw proberen.
+    for (int i = 0; i < 5; i++) {
+        if (med->phy_reg_read(med, LAN8720_PHY_ADDR, reg, &val) == ESP_OK) return true;
+        delay(2);
+    }
+    return false;
+}
+
+void lan8720LogRegs(const char* why) {
+    uint32_t bmsr = 0, anar = 0, anlpar = 0, aner = 0, symerr = 0, scsi = 0, pscsr = 0;
+    lan8720Read(1, bmsr);    // basic status
+    lan8720Read(4, anar);    // onze advertisement
+    lan8720Read(5, anlpar);  // advertisement van de switch
+    lan8720Read(6, aner);    // autoneg expansion (bit4 = parallel-detect fault)
+    uint32_t mcsr = 0;
+    lan8720Read(17, mcsr);   // bit1 = ENERGYON (signaal op de lijn)
+    lan8720Read(26, symerr); // symbol error counter (signaalkwaliteit)
+    lan8720Read(27, scsi);   // bit13 = MDIX actief
+    lan8720Read(31, pscsr);  // bit12 = autoneg klaar, bits4:2 = speed/duplex
+    diagLog("PHY %s: BMSR=%04x ANAR=%04x ANLPAR=%04x ANER=%04x MCSR=%04x SYMERR=%u SCSI=%04x PSCSR=%04x dns=%s",
+            why, bmsr, anar, anlpar, aner, mcsr, symerr, scsi, pscsr, WiFi.dnsIP(0).toString().c_str());
+}
+
+// Handle al bij driver-start oppakken (niet pas bij link-up), zodat de
+// PHY-registers ook zonder link uit te lezen zijn. Arduino geeft de handle
+// alleen mee met ETH_CONNECTED, dus rechtstreeks op het IDF-event.
+void onEthStartIdf(void*, esp_event_base_t, int32_t, void* data) {
+    ethHandle = *static_cast<esp_eth_handle_t*>(data);
+}
+
+void onEthConnectedInfo(WiFiEvent_t event, WiFiEventInfo_t info) {
+    ethHandle = info.eth_connected;
+    lan8720LogRegs("link-up");
+}
+#endif
 
 void onNetworkEvent(WiFiEvent_t event) {
     switch (event) {
@@ -555,8 +615,6 @@ void onNetworkEvent(WiFiEvent_t event) {
             break;
         case ARDUINO_EVENT_ETH_START:
             diagLog("ETH: driver gestart");
-            ethDriverStartedAt = millis();
-            ethPhyRetried = false;
             if (!deviceHostname.isEmpty()) {
                 ETH.setHostname(deviceHostname.c_str());
             }
@@ -585,18 +643,28 @@ void onNetworkEvent(WiFiEvent_t event) {
             diagLog("ETH: verbinding verloren");
             ethConnected = false;
             ethDhcpRetried = false;
-            // ETH weg — auto-reconnect aan + WiFi als fallback starten.
+#ifndef BOARD_V4
+            lan8720LogRegs("link-down");
+#endif
+            // ETH weg — auto-reconnect aan + WiFi als fallback starten. Niet
+            // als WiFi al verbonden is: WiFi.begin() verbreekt dan de werkende
+            // sessie (bij een flappende ETH-link elke paar seconden).
             if (!wifiSsid.isEmpty()) {
-                diagLog("ETH weg — WiFi-fallback starten");
                 WiFi.setAutoReconnect(true);
-                WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+                if (WiFi.status() != WL_CONNECTED) {
+                    diagLog("ETH weg — WiFi-fallback starten");
+                    WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+                }
             }
             break;
         case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
             diagLog("WiFi: verbinding verloren");
             break;
         case ARDUINO_EVENT_WIFI_STA_GOT_IP:
-            diagLog("WiFi: IP %s", WiFi.localIP().toString().c_str());
+            wifiDns[0] = WiFi.dnsIP(0);
+            wifiDns[1] = WiFi.dnsIP(1);
+            diagLog("WiFi: IP %s dns=%s", WiFi.localIP().toString().c_str(),
+                    wifiDns[0].toString().c_str());
             forceSecureClientReset = true;
             break;
         default:
@@ -1178,6 +1246,13 @@ void setup() {
 
     // Network event-listener (set ETH hostname op ETH_START)
     WiFi.onEvent(onNetworkEvent);
+#ifndef BOARD_V4
+    WiFi.onEvent(onEthConnectedInfo, ARDUINO_EVENT_ETH_CONNECTED);
+    // Default event-loop bestaat pas na ETH.begin(); Arduino tolereert dat
+    // 'ie al aangemaakt is (ESP_ERR_INVALID_STATE).
+    esp_event_loop_create_default();
+    esp_event_handler_register(ETH_EVENT, ETHERNET_EVENT_START, onEthStartIdf, nullptr);
+#endif
 
     // Ethernet EERST starten — WiFi.begin() vóór ETH.begin() kan op ESP32
     // de LAN8720 PHY-initialisatie breken (gedeelde RMII-registers).
@@ -1281,6 +1356,11 @@ void setup() {
     // Lokale management-interface (status + reset-knoppen + OTA) — altijd
     // up, ook in safe-mode (essentieel voor recovery via de gebruiker).
     management.begin(&prefs, FIRMWARE_VERSION, adminPass, &updater);
+#ifndef BOARD_V4
+    management.setPhyRegHook([](bool write, uint8_t reg, uint32_t& val) {
+        return write ? lan8720Write(reg, val) : lan8720Read(reg, val);
+    });
+#endif
     management.setSafeMode(safeMode);
     Serial.printf("Management UI: http://%s/\n",
         ethConnected ? ETH.localIP().toString().c_str() : WiFi.localIP().toString().c_str());
@@ -1329,20 +1409,6 @@ void loop() {
         Serial.println("Bootloop-counter gereset (60s+ uptime stabiel).");
     }
 
-#ifndef BOARD_V4
-    // V3 only: LAN8720 PHY power-cycle als driver draait maar na 15s nog geen link.
-    // ETH.begin() NIET opnieuw (driver draait al, tweede aanroep geeft false).
-    if (!ethPhyRetried && ethDriverStartedAt > 0
-            && !ETH.linkUp() && millis() - ethDriverStartedAt >= 15000) {
-        ethPhyRetried = true;
-        diagLog("ETH: geen link na 15s — PHY power-cycle (driver blijft draaien)");
-        pinMode(33, OUTPUT);
-        digitalWrite(33, LOW);
-        delay(500);
-        digitalWrite(33, HIGH);
-    }
-#endif
-
     // ETH-DHCP-refresh: direct na ETH_CONNECTED (via vlag) en éénmalige
     // retry na 30s. Niet in de event-handler — interfereert met auto-DHCP.
     if (ethDhcpRefreshNeeded && ETH.linkUp() && !ethConnected) {
@@ -1362,6 +1428,22 @@ void loop() {
     if (!ethConnected && millis() < 60000 && millis() - lastEthLog >= 5000) {
         lastEthLog = millis();
         diagLog("ETH poll: link=%d speed=%d", (int)ETH.linkUp(), (int)ETH.linkSpeed());
+#ifndef BOARD_V4
+        lan8720LogRegs("poll");
+#endif
+    }
+
+    // DNS-bewaking: zolang we over WiFi praten moeten de WiFi-DNS-servers
+    // actief zijn (zie wifiDns).
+    if (!ethConnected && WiFi.status() == WL_CONNECTED
+            && (uint32_t)wifiDns[0] != 0 && WiFi.dnsIP(0) != wifiDns[0]) {
+        diagLog("DNS hersteld: %s -> %s", WiFi.dnsIP(0).toString().c_str(),
+                wifiDns[0].toString().c_str());
+        for (int i = 0; i < 2; i++) {
+            if ((uint32_t)wifiDns[i] == 0) continue;
+            ip_addr_t d = IPADDR4_INIT((uint32_t)wifiDns[i]);
+            dns_setserver(i, &d);
+        }
     }
 
     // WiFi-reconnect fallback: setAutoReconnect(true) handelt de meeste

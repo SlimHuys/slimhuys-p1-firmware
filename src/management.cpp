@@ -85,7 +85,40 @@ void ManagementInterface::_setupRoutes() {
                [this]() { _handleOtaUpload(); });
     _server.on("/api/check-update", HTTP_POST, [this]() { _handleCheckUpdate(); });
     _server.on("/api/log", HTTP_GET, [this]() { _handleLog(); });
+    _server.on("/api/phy", HTTP_GET, [this]() { _handlePhy(); });
     _server.onNotFound([this]() { _server.send(404, "text/plain", "not found"); });
+}
+
+void ManagementInterface::_handlePhy() {
+    if (!_requireAuth()) return;
+    if (!_phyRegHook) {
+        _server.send(404, "application/json", "{\"error\":\"geen PHY\"}");
+        return;
+    }
+    if (_server.hasArg("r")) {
+        uint8_t reg = (uint8_t)_server.arg("r").toInt();
+        uint32_t val = 0;
+        bool write = _server.hasArg("v");
+        if (write) val = strtoul(_server.arg("v").c_str(), nullptr, 16);
+        bool ok = _phyRegHook(write, reg, val);
+        if (write && ok) ok = _phyRegHook(false, reg, val);  // teruglezen
+        char buf[64];
+        snprintf(buf, sizeof(buf), "{\"ok\":%s,\"r\":%u,\"v\":\"%04x\"}",
+                 ok ? "true" : "false", reg, (unsigned)val);
+        _server.send(ok ? 200 : 500, "application/json", buf);
+        return;
+    }
+    String out = "{";
+    for (uint8_t reg = 0; reg < 32; reg++) {
+        uint32_t val = 0;
+        bool ok = _phyRegHook(false, reg, val);
+        char buf[24];
+        snprintf(buf, sizeof(buf), "%s\"%u\":\"%s%04x\"", reg ? "," : "", reg,
+                 ok ? "" : "!", (unsigned)val);
+        out += buf;
+    }
+    out += "}";
+    _server.send(200, "application/json", out);
 }
 
 void ManagementInterface::_handleRoot() {

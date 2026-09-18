@@ -13,11 +13,14 @@
  *   POST /api/repair        → wis api_key, reboot → portal voor nieuwe code
  *   POST /api/factory-reset → wis alle NVS, reboot → eerste-setup
  *   POST /api/ota           → multipart firmware.bin upload, flash + reboot
+ *   GET  /api/phy           → dump PHY-registers 0-31 (alleen als hook gezet)
+ *   GET  /api/phy?r=N&v=HEX → schrijf PHY-register N (diagnose)
  */
 #pragma once
 #include <Arduino.h>
 #include <Preferences.h>
 #include <WebServer.h>
+#include <functional>
 
 #include "updater.h"
 
@@ -50,6 +53,9 @@ public:
     void recordLeakPush(int httpStatus);
     void recordParse(bool ok, const String& error = String());
     void setSafeMode(bool enabled) { _safeMode = enabled; }
+    // PHY-registertoegang voor /api/phy; write=false → val wordt gevuld.
+    using PhyRegHook = std::function<bool(bool write, uint8_t reg, uint32_t& val)>;
+    void setPhyRegHook(PhyRegHook hook) { _phyRegHook = hook; }
     // Voor diagnostics-push: meest recente P1-push HTTP-status,
     // gebruikt om "ok"/"fail" af te leiden in de payload.
     int lastPushStatus() const { return _lastPushStatus; }
@@ -77,6 +83,7 @@ private:
     void _handleOtaUpload();
     void _handleCheckUpdate();
     void _handleLog();
+    void _handlePhy();
 
     WebServer _server{80};
     Preferences* _prefs = nullptr;
@@ -84,6 +91,7 @@ private:
     String _version;
     String _adminUser = "admin";
     String _adminPass;
+    PhyRegHook _phyRegHook;
 
     int _lastPushStatus = 0;
     unsigned long _lastPushAt = 0;
