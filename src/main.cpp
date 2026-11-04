@@ -916,6 +916,17 @@ void pushWorkerTask(void* /*param*/) {
     // collectHeaders() bewaart alleen pointers — daarom static const.
     static const char* COLLECTED_HEADERS[] = {"X-Mgmt-Refresh"};
 
+    // Eén HTTPClient voor de hele levensduur van de task, niet één per job:
+    // ~HTTPClient() roept _client->stop() aan, dus een lokale HTTPClient
+    // sloot na elke push de TLS-verbinding en setReuse(true) deed niets.
+    // Elke 1 Hz-push kostte zo een volle handshake (~1,2-1,7 s), de queue
+    // (10) stond permanent vol: ~15 s vertraging en weggegooide metingen
+    // (gemeten 2026-11-04). end() wist de request-headers (clear()) en
+    // sendRequest() de opgevangen response-headers, dus hergebruik is veilig.
+    static HTTPClient http;
+    http.setReuse(true);
+    http.collectHeaders(COLLECTED_HEADERS, 1);
+
     for (;;) {
         esp_task_wdt_reset();
         PushJob* job = nullptr;
@@ -931,13 +942,10 @@ void pushWorkerTask(void* /*param*/) {
             secureClient.stop();
         }
 
-        HTTPClient http;
-        http.setReuse(true);
         http.begin(secureClient, job->url);
         http.addHeader("Authorization", "Bearer " + apiKey);
         http.addHeader("Content-Type", "application/json");
         http.addHeader("User-Agent", "slimhuys-p1/" FIRMWARE_VERSION);
-        http.collectHeaders(COLLECTED_HEADERS, 1);
 
         int code = (job->method == "PUT")
                    ? http.PUT(job->payload)
